@@ -1,0 +1,32 @@
+{
+  "name": "semantic-watch",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Telegram service for semantic monitoring of meaningful web page changes.",
+  "engines": {
+    "node": ">=20.18.0"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start:prod": "node dist/src/index.js",
+    "typecheck": "tsc --noEmit",
+    "demo": "tsx demo-site/server.ts",
+    "demo:closed": "tsx demo-site/switch-state.ts closed",
+    "demo:speakers": "tsx demo-site/switch-state.ts speakers",
+    "demo:open": "tsx demo-site/switch-state.ts open"
+  },
+  "dependencies": {
+    "cheerio": "1.2.0",
+    "dotenv": "17.4.2",
+    "grammy": "1.44.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.1",
+    "tsx": "4.22.5",
+    "typescript": "5.9.2"
+  }
+}
