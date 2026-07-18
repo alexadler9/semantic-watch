@@ -67,19 +67,47 @@ ACCESS_KEY=replace_with_a_long_random_value
 Установите зависимости:
 
 ```powershell
-npm install
+pnpm install
 ```
 
 Проверьте TypeScript:
 
 ```powershell
-npm run typecheck
+pnpm run typecheck
 ```
 
 ### Терминал 1: Telegram-бот
 
 ```powershell
-npm start
+pnpm start
+```
+
+### Терминал 2: демонстрационная страница
+
+Установите исходное состояние страницы:
+
+```powershell
+pnpm run demo:closed
+```
+
+Запустите локальный сервер:
+
+```powershell
+pnpm run demo
+```
+
+Страница будет доступна по адресу:
+
+```text
+http://127.0.0.1:3001/
+```
+
+Доступные состояния:
+
+```powershell
+pnpm run demo:closed
+pnpm run demo:speakers
+pnpm run demo:open
 ```
 
 ## Ограничения доступа
