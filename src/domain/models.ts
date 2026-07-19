@@ -1,4 +1,5 @@
 export type WatchStatus = "ACTIVE" | "PAUSED" | "STOPPED";
+export type ResultFeedbackStatus = "PENDING" | "CONFIRMED" | "REJECTED";
 
 export interface AuthorizedUser {
   telegramUserId: string;
@@ -11,15 +12,29 @@ export interface WatchPolicy {
   ignoredChanges: string[];
 }
 
+export interface PolicyRevision {
+  version: number;
+  policy: WatchPolicy;
+  reason: string;
+  createdAt: string;
+}
+
+export interface SemanticState {
+  summary: string;
+  updatedAt: string;
+}
+
 export interface SemanticEvaluation {
   meaningfulChange: boolean;
   conditionMatched: boolean;
   confidence: number;
   summary: string;
   evidence: string[];
+  currentState: string;
 }
 
 export interface PendingNotification {
+  id: string;
   fingerprint: string;
   summary: string;
   evidence: string[];
@@ -30,12 +45,26 @@ export interface PendingNotification {
   lastError: string | null;
 }
 
+export interface DeliveredResult {
+  id: string;
+  fingerprint: string;
+  summary: string;
+  evidence: string[];
+  createdAt: string;
+  deliveredAt: string;
+  feedbackStatus: ResultFeedbackStatus;
+  feedbackReason: string | null;
+}
+
 export interface Watch {
   id: string;
   ownerTelegramId: string;
   url: string;
   instruction: string;
   policy: WatchPolicy | null;
+  policyVersion: number;
+  policyHistory: PolicyRevision[];
+  semanticState: SemanticState | null;
   status: WatchStatus;
   createdAt: string;
   stoppedAt: string | null;
@@ -45,6 +74,7 @@ export interface Watch {
   lastSnapshot: string;
   lastNotificationFingerprint: string | null;
   pendingNotification: PendingNotification | null;
+  lastDeliveredResult: DeliveredResult | null;
   consecutiveFailures: number;
   lastCheckError: string | null;
   pageTitle: string | null;

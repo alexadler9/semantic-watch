@@ -3,6 +3,8 @@ import { Bot, InlineKeyboard, Keyboard, type Context } from "grammy";
 import {
   PolicyNotUnderstoodError,
   PolicyResponseError,
+  type FeedbackReason,
+  type PolicyPreparation,
   type SemanticEvaluator,
 } from "../ai/semantic-evaluator.js";
 import {
@@ -11,11 +13,18 @@ import {
   type WatchCheckService,
 } from "../checker/watch-check-service.js";
 import type { AppConfig } from "../config/config.js";
-import type { PageSnapshot, Watch, WatchPolicy } from "../domain/models.js";
+import type {
+  DeliveredResult,
+  PageSnapshot,
+  PendingNotification,
+  Watch,
+  WatchPolicy,
+} from "../domain/models.js";
 import { SafePageFetcher } from "../fetcher/safe-page-fetcher.js";
 import {
   formatImportantChange,
   importantNotificationKeyboard,
+  resolvedNotificationKeyboard,
 } from "../notifications/telegram-messages.js";
 import { JsonStore } from "../storage/json-store.js";
 import { normalizeInstruction, truncate } from "../utils/text.js";
@@ -31,6 +40,7 @@ const FLOW_CANCEL = "flow:cancel";
 const FLOW_BACK = "flow:back";
 const FLOW_CONFIRM = "flow:confirm";
 const FLOW_REFINE = "flow:refine";
+const POLICY_CLARIFY_CUSTOM = "policy:clarify-custom";
 
 interface PendingBase {
   screenMessageId: number;
@@ -45,15 +55,67 @@ interface WaitingInstruction extends PendingBase {
   url: string;
 }
 
+interface WaitingClarification extends PendingBase {
+  step: "WAITING_CLARIFICATION";
+  url: string;
+  instruction: string;
+  snapshot: PageSnapshot;
+  question: string;
+  options: string[];
+}
+
+interface WaitingClarificationText extends PendingBase {
+  step: "WAITING_CLARIFICATION_TEXT";
+  url: string;
+  instruction: string;
+  snapshot: PageSnapshot;
+  question: string;
+  options: string[];
+}
+
 interface WaitingConfirmation extends PendingBase {
   step: "WAITING_CONFIRMATION";
   url: string;
   instruction: string;
   policy: WatchPolicy;
+  currentState: string;
   snapshot: PageSnapshot;
 }
 
-type PendingWatch = WaitingUrl | WaitingInstruction | WaitingConfirmation;
+type PendingWatch =
+  | WaitingUrl
+  | WaitingInstruction
+  | WaitingClarification
+  | WaitingClarificationText
+  | WaitingConfirmation;
+
+interface FeedbackBase {
+  watchId: string;
+  resultId: string;
+  notificationMessageId: number;
+  screenMessageId: number;
+}
+
+interface WaitingFeedbackReason extends FeedbackBase {
+  step: "WAITING_FEEDBACK_REASON";
+  reasons: FeedbackReason[];
+}
+
+interface WaitingFeedbackText extends FeedbackBase {
+  step: "WAITING_FEEDBACK_TEXT";
+}
+
+interface WaitingFeedbackConfirmation extends FeedbackBase {
+  step: "WAITING_FEEDBACK_CONFIRMATION";
+  reason: string;
+  proposedPolicy: WatchPolicy;
+  explanation: string;
+}
+
+type PendingFeedback =
+  | WaitingFeedbackReason
+  | WaitingFeedbackText
+  | WaitingFeedbackConfirmation;
 
 type PageAction =
   | "view"
@@ -64,10 +126,13 @@ type PageAction =
   | "delete-confirm"
   | "delete-cancel";
 
-interface NotificationAction {
-  action: "pause";
-  watchId: string;
-}
+type NotificationAction =
+  | { action: "pause"; watchId: string }
+  | { action: "accept" | "reject"; watchId: string; resultId: string };
+
+type FeedbackAction =
+  | { action: "reason"; resultId: string; index: number }
+  | { action: "custom" | "save" | "edit" | "cancel"; resultId: string };
 
 export function createBot(
   appConfig: AppConfig,
@@ -80,10 +145,14 @@ export function createBot(
   const bot = new Bot(appConfig.telegramBotToken);
   const accessService = new AccessService(appConfig, store);
   const pendingWatches = new Map<string, PendingWatch>();
+  const pendingFeedback = new Map<string, PendingFeedback>();
 
   bot.command("start", async (ctx) => {
     await tryDeleteIncomingMessage(ctx);
     const userId = getUserId(ctx);
+    pendingWatches.delete(userId);
+    pendingFeedback.delete(userId);
+
     if (!(await accessService.isAllowed(userId))) {
       const message = await ctx.reply(unauthorizedText(userId, accessService.isActivationEnabled()));
       screenMessages.set(userId, message.message_id);
@@ -97,7 +166,6 @@ export function createBot(
   bot.command("activate", async (ctx) => {
     const userId = getUserId(ctx);
     const key = ctx.match.trim();
-    // Ключ не должен оставаться в истории Telegram.
     await tryDeleteIncomingMessage(ctx);
 
     if (await accessService.isAllowed(userId)) {
@@ -135,6 +203,7 @@ export function createBot(
     const userId = await requireAccess(ctx, accessService);
     if (!userId) return;
     await tryDeleteIncomingMessage(ctx);
+    pendingFeedback.delete(userId);
     await startAddPage(ctx, userId, pendingWatches, screenMessages, store, appConfig);
   });
 
@@ -143,6 +212,7 @@ export function createBot(
     if (!userId) return;
     await tryDeleteIncomingMessage(ctx);
     pendingWatches.delete(userId);
+    pendingFeedback.delete(userId);
     await showTrackedPages(ctx, userId, store, screenMessages);
   });
 
@@ -150,6 +220,8 @@ export function createBot(
     const userId = await requireAccess(ctx, accessService);
     if (!userId) return;
     await tryDeleteIncomingMessage(ctx);
+    pendingWatches.delete(userId);
+    pendingFeedback.delete(userId);
 
     const resolved = await resolveWatchForCommandCheck(store, userId, ctx.match.trim());
     if (typeof resolved === "string") {
@@ -159,7 +231,6 @@ export function createBot(
     await checkPageAndRender(ctx, userId, resolved, store, checkService, screenMessages);
   });
 
-  // Команда оставлена для совместимости. В основном интерфейсе удаление выполняется кнопкой.
   bot.command("stop", async (ctx) => {
     const userId = await requireAccess(ctx, accessService);
     if (!userId) return;
@@ -192,15 +263,17 @@ export function createBot(
     if (!userId) return;
     await tryDeleteIncomingMessage(ctx);
 
-    const pending = pendingWatches.get(userId);
+    const watchDraft = pendingWatches.get(userId);
+    const feedbackDraft = pendingFeedback.get(userId);
     pendingWatches.delete(userId);
+    pendingFeedback.delete(userId);
     await renderScreen(
       ctx,
       userId,
       screenMessages,
-      pending ? "Настройка отменена." : "Сейчас нет незавершённой настройки.",
+      watchDraft || feedbackDraft ? "Настройка отменена." : "Сейчас нет незавершённой настройки.",
       mainNavigationKeyboard(),
-      pending?.screenMessageId,
+      watchDraft?.screenMessageId ?? feedbackDraft?.screenMessageId,
     );
   });
 
@@ -214,13 +287,35 @@ export function createBot(
     const data = ctx.callbackQuery.data;
     const notificationAction = parseNotificationAction(data);
     if (notificationAction) {
-      await handleNotificationAction(ctx, userId, notificationAction, store);
+      await handleNotificationAction(
+        ctx,
+        userId,
+        notificationAction,
+        store,
+        semanticEvaluator,
+        pendingFeedback,
+        screenMessages,
+      );
       return;
     }
 
     const callbackMessageId = getCallbackMessageId(ctx);
     if (callbackMessageId !== null) {
       screenMessages.set(userId, callbackMessageId);
+    }
+
+    const feedbackAction = parseFeedbackAction(data);
+    if (feedbackAction) {
+      await handleFeedbackAction(
+        ctx,
+        userId,
+        feedbackAction,
+        store,
+        semanticEvaluator,
+        pendingFeedback,
+        screenMessages,
+      );
+      return;
     }
 
     if (data === FLOW_CANCEL) {
@@ -253,7 +348,7 @@ export function createBot(
         return;
       }
 
-      if (pending.step === "WAITING_CONFIRMATION") {
+      if (pending.step === "WAITING_CONFIRMATION" || pending.step === "WAITING_CLARIFICATION") {
         const next: WaitingInstruction = {
           step: "WAITING_INSTRUCTION",
           url: pending.url,
@@ -261,6 +356,21 @@ export function createBot(
         };
         pendingWatches.set(userId, next);
         await askForInstruction(ctx, userId, screenMessages, next.screenMessageId);
+        return;
+      }
+
+      if (pending.step === "WAITING_CLARIFICATION_TEXT") {
+        const next: WaitingClarification = {
+          step: "WAITING_CLARIFICATION",
+          url: pending.url,
+          instruction: pending.instruction,
+          snapshot: pending.snapshot,
+          question: pending.question,
+          options: pending.options,
+          screenMessageId: pending.screenMessageId,
+        };
+        pendingWatches.set(userId, next);
+        await renderPolicyClarification(ctx, userId, screenMessages, next);
         return;
       }
 
@@ -352,8 +462,71 @@ export function createBot(
       return;
     }
 
+    const clarificationIndex = parsePolicyClarificationIndex(data);
+    if (clarificationIndex !== null) {
+      await ctx.answerCallbackQuery({ text: "Уточняю правило" });
+      const pending = pendingWatches.get(userId);
+      if (!pending || pending.step !== "WAITING_CLARIFICATION") {
+        await renderScreen(
+          ctx,
+          userId,
+          screenMessages,
+          "Уточнение устарело. Начните настройку заново.",
+          mainNavigationKeyboard(),
+          callbackMessageId ?? undefined,
+        );
+        return;
+      }
+      const selected = pending.options[clarificationIndex];
+      if (!selected) {
+        await ctx.answerCallbackQuery({ text: "Вариант устарел." });
+        return;
+      }
+      await preparePolicyFromInstruction(
+        ctx,
+        userId,
+        pending,
+        `${pending.instruction}\nУточнение пользователя: ${selected}`,
+        semanticEvaluator,
+        pendingWatches,
+        screenMessages,
+      );
+      return;
+    }
+
+    if (data === POLICY_CLARIFY_CUSTOM) {
+      await ctx.answerCallbackQuery();
+      const pending = pendingWatches.get(userId);
+      if (!pending || pending.step !== "WAITING_CLARIFICATION") {
+        await renderScreen(
+          ctx,
+          userId,
+          screenMessages,
+          "Уточнение устарело. Начните настройку заново.",
+          mainNavigationKeyboard(),
+          callbackMessageId ?? undefined,
+        );
+        return;
+      }
+      const next: WaitingClarificationText = {
+        ...pending,
+        step: "WAITING_CLARIFICATION_TEXT",
+      };
+      pendingWatches.set(userId, next);
+      await renderScreen(
+        ctx,
+        userId,
+        screenMessages,
+        "Напишите уточнение своими словами.",
+        instructionNavigationKeyboard(),
+        next.screenMessageId,
+      );
+      return;
+    }
+
     if (data === "nav:add") {
       await ctx.answerCallbackQuery();
+      pendingFeedback.delete(userId);
       await startAddPage(ctx, userId, pendingWatches, screenMessages, store, appConfig);
       return;
     }
@@ -361,6 +534,7 @@ export function createBot(
     if (data === "nav:list") {
       await ctx.answerCallbackQuery();
       pendingWatches.delete(userId);
+      pendingFeedback.delete(userId);
       await showTrackedPages(ctx, userId, store, screenMessages);
       return;
     }
@@ -379,12 +553,11 @@ export function createBot(
     }
 
     switch (pageAction.action) {
-      case "view": {
+      case "view":
         await ctx.answerCallbackQuery();
         await renderPageCard(ctx, userId, watch, screenMessages, callbackMessageId ?? undefined);
         return;
-      }
-      case "check": {
+      case "check":
         if (watch.status !== "ACTIVE") {
           await ctx.answerCallbackQuery({ text: "Сначала возобновите отслеживание." });
           return;
@@ -392,7 +565,6 @@ export function createBot(
         await ctx.answerCallbackQuery({ text: "Проверяю" });
         await checkPageAndRender(ctx, userId, watch, store, checkService, screenMessages);
         return;
-      }
       case "pause": {
         const paused = await store.pauseWatch(userId, watch.id);
         await ctx.answerCallbackQuery({
@@ -415,7 +587,7 @@ export function createBot(
         }
         return;
       }
-      case "delete": {
+      case "delete":
         await ctx.answerCallbackQuery();
         await renderScreen(
           ctx,
@@ -426,12 +598,10 @@ export function createBot(
           callbackMessageId ?? undefined,
         );
         return;
-      }
-      case "delete-cancel": {
+      case "delete-cancel":
         await ctx.answerCallbackQuery({ text: "Удаление отменено" });
         await renderPageCard(ctx, userId, watch, screenMessages, callbackMessageId ?? undefined);
         return;
-      }
       case "delete-confirm": {
         const deleted = await store.deleteWatch(userId, watch.id);
         await ctx.answerCallbackQuery({ text: deleted ? "Страница удалена" : "Страница не найдена" });
@@ -458,17 +628,47 @@ export function createBot(
     await tryDeleteIncomingMessage(ctx);
 
     if (text === MENU_ADD_PAGE) {
+      pendingFeedback.delete(userId);
       await startAddPage(ctx, userId, pendingWatches, screenMessages, store, appConfig);
       return;
     }
     if (text === MENU_TRACKED_PAGES) {
       pendingWatches.delete(userId);
+      pendingFeedback.delete(userId);
       await showTrackedPages(ctx, userId, store, screenMessages);
       return;
     }
     if (text === MENU_HELP) {
       pendingWatches.delete(userId);
+      pendingFeedback.delete(userId);
       await renderScreen(ctx, userId, screenMessages, helpText(), mainNavigationKeyboard());
+      return;
+    }
+
+    const feedbackDraft = pendingFeedback.get(userId);
+    if (feedbackDraft?.step === "WAITING_FEEDBACK_TEXT") {
+      const clarification = normalizeInstruction(text);
+      if (clarification.length < 5 || clarification.length > 1000) {
+        await renderScreen(
+          ctx,
+          userId,
+          screenMessages,
+          "Опишите причину чуть подробнее, но не длиннее 1000 символов.",
+          feedbackTextKeyboard(feedbackDraft.resultId),
+          feedbackDraft.screenMessageId,
+        );
+        return;
+      }
+      await prepareRefinedPolicy(
+        ctx,
+        userId,
+        feedbackDraft,
+        clarification,
+        store,
+        semanticEvaluator,
+        pendingFeedback,
+        screenMessages,
+      );
       return;
     }
 
@@ -512,9 +712,39 @@ export function createBot(
         ctx,
         userId,
         screenMessages,
-        formatPolicyPreview(pending.snapshot, pending.policy),
+        formatPolicyPreview(pending.snapshot, pending.policy, pending.currentState),
         policyConfirmationKeyboard(),
         pending.screenMessageId,
+      );
+      return;
+    }
+
+    if (pending.step === "WAITING_CLARIFICATION") {
+      await renderPolicyClarification(ctx, userId, screenMessages, pending);
+      return;
+    }
+
+    if (pending.step === "WAITING_CLARIFICATION_TEXT") {
+      const clarification = normalizeInstruction(text);
+      if (clarification.length < 5 || clarification.length > 1000) {
+        await renderScreen(
+          ctx,
+          userId,
+          screenMessages,
+          "Уточнение должно содержать от 5 до 1000 символов.",
+          instructionNavigationKeyboard(),
+          pending.screenMessageId,
+        );
+        return;
+      }
+      await preparePolicyFromInstruction(
+        ctx,
+        userId,
+        pending,
+        `${pending.instruction}\nУточнение пользователя: ${clarification}`,
+        semanticEvaluator,
+        pendingWatches,
+        screenMessages,
       );
       return;
     }
@@ -554,7 +784,6 @@ export function createBot(
 
     let snapshot: PageSnapshot;
     try {
-      // URL проверяется до LLM-вызова, чтобы не расходовать токены на недоступную страницу.
       snapshot = await pageFetcher.fetch(pending.url);
     } catch (error) {
       pendingWatches.set(userId, pending);
@@ -569,46 +798,21 @@ export function createBot(
       return;
     }
 
-    await renderScreen(
+    const base = {
+      url: pending.url,
+      instruction,
+      snapshot,
+      screenMessageId: pending.screenMessageId,
+    };
+    await preparePolicyFromInstruction(
       ctx,
       userId,
+      base,
+      instruction,
+      semanticEvaluator,
+      pendingWatches,
       screenMessages,
-      "Страница доступна. Формирую правило отслеживания…",
-      undefined,
-      pending.screenMessageId,
     );
-
-    try {
-      const policy = await semanticEvaluator.createPolicy(instruction);
-      const next: WaitingConfirmation = {
-        step: "WAITING_CONFIRMATION",
-        url: pending.url,
-        instruction,
-        policy,
-        snapshot,
-        screenMessageId: pending.screenMessageId,
-      };
-      pendingWatches.set(userId, next);
-
-      await renderScreen(
-        ctx,
-        userId,
-        screenMessages,
-        formatPolicyPreview(snapshot, policy),
-        policyConfirmationKeyboard(),
-        next.screenMessageId,
-      );
-    } catch (error) {
-      pendingWatches.set(userId, pending);
-      await renderScreen(
-        ctx,
-        userId,
-        screenMessages,
-        formatPolicyError(error),
-        instructionNavigationKeyboard(),
-        pending.screenMessageId,
-      );
-    }
   });
 
   bot.catch((error) => {
@@ -683,6 +887,126 @@ async function askForInstruction(
   );
 }
 
+async function preparePolicyFromInstruction(
+  ctx: Context,
+  userId: string,
+  base: {
+    url: string;
+    instruction: string;
+    snapshot: PageSnapshot;
+    screenMessageId: number;
+  },
+  effectiveInstruction: string,
+  semanticEvaluator: SemanticEvaluator,
+  pendingWatches: Map<string, PendingWatch>,
+  screenMessages: ScreenMessageRegistry,
+): Promise<void> {
+  await renderScreen(
+    ctx,
+    userId,
+    screenMessages,
+    "Страница доступна. Формирую правило отслеживания…",
+    undefined,
+    base.screenMessageId,
+  );
+
+  try {
+    const preparation = await semanticEvaluator.preparePolicy({
+      instruction: effectiveInstruction,
+      pageText: base.snapshot.text,
+    });
+    await applyPolicyPreparation(
+      ctx,
+      userId,
+      base,
+      effectiveInstruction,
+      preparation,
+      pendingWatches,
+      screenMessages,
+    );
+  } catch (error) {
+    const next: WaitingInstruction = {
+      step: "WAITING_INSTRUCTION",
+      url: base.url,
+      screenMessageId: base.screenMessageId,
+    };
+    pendingWatches.set(userId, next);
+    await renderScreen(
+      ctx,
+      userId,
+      screenMessages,
+      formatPolicyError(error),
+      instructionNavigationKeyboard(),
+      base.screenMessageId,
+    );
+  }
+}
+
+async function applyPolicyPreparation(
+  ctx: Context,
+  userId: string,
+  base: {
+    url: string;
+    instruction: string;
+    snapshot: PageSnapshot;
+    screenMessageId: number;
+  },
+  effectiveInstruction: string,
+  preparation: PolicyPreparation,
+  pendingWatches: Map<string, PendingWatch>,
+  screenMessages: ScreenMessageRegistry,
+): Promise<void> {
+  if (preparation.kind === "NEEDS_CLARIFICATION") {
+    const next: WaitingClarification = {
+      step: "WAITING_CLARIFICATION",
+      url: base.url,
+      instruction: effectiveInstruction,
+      snapshot: base.snapshot,
+      question: preparation.question,
+      options: preparation.options,
+      screenMessageId: base.screenMessageId,
+    };
+    pendingWatches.set(userId, next);
+    await renderPolicyClarification(ctx, userId, screenMessages, next);
+    return;
+  }
+
+  const next: WaitingConfirmation = {
+    step: "WAITING_CONFIRMATION",
+    url: base.url,
+    instruction: effectiveInstruction,
+    policy: preparation.policy,
+    currentState: preparation.currentState,
+    snapshot: base.snapshot,
+    screenMessageId: base.screenMessageId,
+  };
+  pendingWatches.set(userId, next);
+  await renderScreen(
+    ctx,
+    userId,
+    screenMessages,
+    formatPolicyPreview(next.snapshot, next.policy, next.currentState),
+    policyConfirmationKeyboard(),
+    next.screenMessageId,
+  );
+}
+
+async function renderPolicyClarification(
+  ctx: Context,
+  userId: string,
+  screenMessages: ScreenMessageRegistry,
+  pending: WaitingClarification,
+): Promise<void> {
+  await renderScreen(
+    ctx,
+    userId,
+    screenMessages,
+    ["Нужно небольшое уточнение.", "", pending.question].join("\n"),
+    policyClarificationKeyboard(pending.options),
+    pending.screenMessageId,
+  );
+}
+
 async function showTrackedPages(
   ctx: Context,
   userId: string,
@@ -749,13 +1073,7 @@ async function checkPageAndRender(
   );
 
   if (watch.pendingNotification) {
-    await sendPermanentNotification(
-      ctx,
-      userId,
-      watch,
-      watch.pendingNotification,
-      screenMessages,
-    );
+    await sendPermanentNotification(ctx, userId, watch, watch.pendingNotification, screenMessages);
     await store.markNotificationDelivered({
       telegramUserId: userId,
       watchId: watch.id,
@@ -768,12 +1086,12 @@ async function checkPageAndRender(
     const result = await checkService.check(watch);
     const updatedWatch = (await store.findTrackedWatch(userId, watch.id)) ?? result.watch;
 
-    if (result.kind === "MATCH" && !result.duplicate) {
+    if (result.kind === "MATCH" && !result.duplicate && updatedWatch.pendingNotification) {
       await sendPermanentNotification(
         ctx,
         userId,
         updatedWatch,
-        result.evaluation,
+        updatedWatch.pendingNotification,
         screenMessages,
       );
       await store.markNotificationDelivered({
@@ -813,16 +1131,11 @@ async function sendPermanentNotification(
   ctx: Context,
   userId: string,
   watch: Watch,
-  evaluation: {
-    summary: string;
-    evidence: string[];
-  },
+  notification: PendingNotification,
   screenMessages: ScreenMessageRegistry,
 ): Promise<void> {
   const chatId = ctx.chat?.id;
-  if (chatId === undefined) {
-    throw new Error("Telegram chat ID is unavailable.");
-  }
+  if (chatId === undefined) throw new Error("Telegram chat ID is unavailable.");
 
   const transientScreenId = screenMessages.get(userId);
   if (transientScreenId !== undefined) {
@@ -835,10 +1148,292 @@ async function sendPermanentNotification(
     }
   }
 
-  await ctx.api.sendMessage(chatId, formatImportantChange(watch, evaluation), {
+  await ctx.api.sendMessage(chatId, formatImportantChange(watch, notification), {
     link_preview_options: { is_disabled: true },
-    reply_markup: importantNotificationKeyboard(watch),
+    reply_markup: importantNotificationKeyboard(watch, notification),
   });
+}
+
+async function handleNotificationAction(
+  ctx: Context,
+  userId: string,
+  action: NotificationAction,
+  store: JsonStore,
+  semanticEvaluator: SemanticEvaluator,
+  pendingFeedback: Map<string, PendingFeedback>,
+  screenMessages: ScreenMessageRegistry,
+): Promise<void> {
+  const watch = await store.findTrackedWatch(userId, action.watchId);
+  if (!watch) {
+    await ctx.answerCallbackQuery({ text: "Страница не найдена.", show_alert: true });
+    return;
+  }
+
+  if (action.action === "pause") {
+    const paused = await store.pauseWatch(userId, watch.id);
+    await ctx.answerCallbackQuery({
+      text: paused ? "Отслеживание приостановлено" : "Уже приостановлено",
+    });
+    await editNotificationKeyboard(ctx, { ...watch, status: paused ? "PAUSED" : watch.status });
+    return;
+  }
+
+  const result = watch.lastDeliveredResult;
+  if (!result || result.id !== action.resultId) {
+    await ctx.answerCallbackQuery({ text: "Этот результат уже устарел.", show_alert: true });
+    return;
+  }
+
+  if (action.action === "accept") {
+    const confirmed = await store.confirmDeliveredResult({
+      telegramUserId: userId,
+      watchId: watch.id,
+      resultId: result.id,
+    });
+    await ctx.answerCallbackQuery({
+      text: confirmed ? "Спасибо, правило сработало верно" : "Ответ уже сохранён",
+    });
+    await editNotificationKeyboard(ctx, watch);
+    return;
+  }
+
+  await ctx.answerCallbackQuery({ text: "Готовлю варианты уточнения" });
+  let reasons: FeedbackReason[];
+  try {
+    reasons = await semanticEvaluator.suggestFeedbackReasons({
+      instruction: watch.instruction,
+      policy: watch.policy ?? fallbackPolicy(watch),
+      summary: result.summary,
+      evidence: result.evidence,
+    });
+  } catch {
+    reasons = fallbackFeedbackReasons();
+  }
+
+  const screenMessageId = await sendNewScreenBelowNotification(
+    ctx,
+    userId,
+    screenMessages,
+    "Почему этот результат не подходит?",
+    feedbackReasonsKeyboard(result.id, reasons),
+  );
+  const notificationMessageId = getCallbackMessageId(ctx);
+  if (notificationMessageId === null) return;
+  pendingFeedback.set(userId, {
+    step: "WAITING_FEEDBACK_REASON",
+    watchId: watch.id,
+    resultId: result.id,
+    notificationMessageId,
+    screenMessageId,
+    reasons,
+  });
+}
+
+async function handleFeedbackAction(
+  ctx: Context,
+  userId: string,
+  action: FeedbackAction,
+  store: JsonStore,
+  semanticEvaluator: SemanticEvaluator,
+  pendingFeedback: Map<string, PendingFeedback>,
+  screenMessages: ScreenMessageRegistry,
+): Promise<void> {
+  const pending = pendingFeedback.get(userId);
+  if (!pending || pending.resultId !== action.resultId) {
+    await ctx.answerCallbackQuery({ text: "Черновик уточнения устарел.", show_alert: true });
+    return;
+  }
+
+  if (action.action === "cancel") {
+    pendingFeedback.delete(userId);
+    await ctx.answerCallbackQuery({ text: "Правило не изменено" });
+    await renderScreen(
+      ctx,
+      userId,
+      screenMessages,
+      "Уточнение отменено. Исходное правило осталось без изменений.",
+      mainNavigationKeyboard(),
+      pending.screenMessageId,
+    );
+    return;
+  }
+
+  if (action.action === "custom" || action.action === "edit") {
+    await ctx.answerCallbackQuery();
+    const next: WaitingFeedbackText = {
+      step: "WAITING_FEEDBACK_TEXT",
+      watchId: pending.watchId,
+      resultId: pending.resultId,
+      notificationMessageId: pending.notificationMessageId,
+      screenMessageId: pending.screenMessageId,
+    };
+    pendingFeedback.set(userId, next);
+    await renderScreen(
+      ctx,
+      userId,
+      screenMessages,
+      "Объясните своими словами, почему результат не подходит и что нужно учитывать дальше.",
+      feedbackTextKeyboard(pending.resultId),
+      pending.screenMessageId,
+    );
+    return;
+  }
+
+  if (action.action === "reason") {
+    if (pending.step !== "WAITING_FEEDBACK_REASON") {
+      await ctx.answerCallbackQuery({ text: "Выберите причину заново." });
+      return;
+    }
+    const reason = pending.reasons[action.index];
+    if (!reason) {
+      await ctx.answerCallbackQuery({ text: "Вариант устарел." });
+      return;
+    }
+    await ctx.answerCallbackQuery({ text: "Уточняю правило" });
+    await prepareRefinedPolicy(
+      ctx,
+      userId,
+      pending,
+      reason.clarification,
+      store,
+      semanticEvaluator,
+      pendingFeedback,
+      screenMessages,
+    );
+    return;
+  }
+
+  if (pending.step !== "WAITING_FEEDBACK_CONFIRMATION") {
+    await ctx.answerCallbackQuery({ text: "Сначала подготовьте новое правило." });
+    return;
+  }
+
+  const saved = await store.applyRefinedPolicy({
+    telegramUserId: userId,
+    watchId: pending.watchId,
+    resultId: pending.resultId,
+    policy: pending.proposedPolicy,
+    reason: pending.reason,
+  });
+  await ctx.answerCallbackQuery({
+    text: saved ? "Новое правило сохранено" : "Не удалось сохранить правило",
+  });
+  if (!saved) return;
+
+  pendingFeedback.delete(userId);
+  const watch = await store.findTrackedWatch(userId, pending.watchId);
+  if (watch) {
+    await editMessageKeyboardById(ctx, pending.notificationMessageId, resolvedNotificationKeyboard(watch));
+    await renderScreen(
+      ctx,
+      userId,
+      screenMessages,
+      ["Правило обновлено.", "", pending.explanation, "", formatPageCard(watch)].join("\n"),
+      pageCardKeyboard(watch),
+      pending.screenMessageId,
+    );
+  }
+}
+
+async function prepareRefinedPolicy(
+  ctx: Context,
+  userId: string,
+  pending: FeedbackBase,
+  reason: string,
+  store: JsonStore,
+  semanticEvaluator: SemanticEvaluator,
+  pendingFeedback: Map<string, PendingFeedback>,
+  screenMessages: ScreenMessageRegistry,
+): Promise<void> {
+  const watch = await store.findTrackedWatch(userId, pending.watchId);
+  const result = watch?.lastDeliveredResult;
+  if (!watch || !watch.policy || !result || result.id !== pending.resultId) {
+    pendingFeedback.delete(userId);
+    await renderScreen(
+      ctx,
+      userId,
+      screenMessages,
+      "Результат уже устарел. Правило не изменено.",
+      mainNavigationKeyboard(),
+      pending.screenMessageId,
+    );
+    return;
+  }
+
+  await renderScreen(
+    ctx,
+    userId,
+    screenMessages,
+    "Уточняю правило по вашему ответу…",
+    undefined,
+    pending.screenMessageId,
+  );
+
+  try {
+    const refined = await semanticEvaluator.refinePolicy({
+      instruction: watch.instruction,
+      currentPolicy: watch.policy,
+      resultSummary: result.summary,
+      evidence: result.evidence,
+      userClarification: reason,
+    });
+    const next: WaitingFeedbackConfirmation = {
+      step: "WAITING_FEEDBACK_CONFIRMATION",
+      watchId: watch.id,
+      resultId: result.id,
+      notificationMessageId: pending.notificationMessageId,
+      screenMessageId: pending.screenMessageId,
+      reason,
+      proposedPolicy: refined.policy,
+      explanation: refined.explanation,
+    };
+    pendingFeedback.set(userId, next);
+    await renderScreen(
+      ctx,
+      userId,
+      screenMessages,
+      formatRefinedPolicyPreview(refined.policy, refined.explanation),
+      feedbackConfirmationKeyboard(result.id),
+      next.screenMessageId,
+    );
+  } catch {
+    const next: WaitingFeedbackText = {
+      step: "WAITING_FEEDBACK_TEXT",
+      watchId: watch.id,
+      resultId: result.id,
+      notificationMessageId: pending.notificationMessageId,
+      screenMessageId: pending.screenMessageId,
+    };
+    pendingFeedback.set(userId, next);
+    await renderScreen(
+      ctx,
+      userId,
+      screenMessages,
+      "Не удалось подготовить новое правило. Попробуйте сформулировать уточнение другими словами.",
+      feedbackTextKeyboard(result.id),
+      next.screenMessageId,
+    );
+  }
+}
+
+async function editNotificationKeyboard(ctx: Context, watch: Watch): Promise<void> {
+  const messageId = getCallbackMessageId(ctx);
+  if (messageId === null) return;
+  await editMessageKeyboardById(ctx, messageId, resolvedNotificationKeyboard(watch));
+}
+
+async function editMessageKeyboardById(
+  ctx: Context,
+  messageId: number,
+  keyboard: InlineKeyboard,
+): Promise<void> {
+  const chatId = ctx.chat?.id;
+  if (chatId === undefined) return;
+  try {
+    await ctx.api.editMessageReplyMarkup(chatId, messageId, { reply_markup: keyboard });
+  } catch {
+    // Исходное уведомление остаётся в истории, даже если Telegram не обновил кнопки.
+  }
 }
 
 async function resolveWatchForCommandCheck(
@@ -854,12 +1449,8 @@ async function resolveWatchForCommandCheck(
   }
 
   const watches = await store.listActiveWatches(userId);
-  if (watches.length === 0) {
-    return "Сейчас нет активных страниц для проверки.";
-  }
-  if (watches.length > 1) {
-    return "Откройте «Отслеживаемые страницы» и выберите нужную страницу.";
-  }
+  if (watches.length === 0) return "Сейчас нет активных страниц для проверки.";
+  if (watches.length > 1) return "Откройте «Отслеживаемые страницы» и выберите нужную страницу.";
   return watches[0] ?? "Сейчас нет активных страниц для проверки.";
 }
 
@@ -875,6 +1466,19 @@ function createWatchFromDraft(
     url: draft.snapshot.finalUrl,
     instruction: draft.instruction,
     policy: draft.policy,
+    policyVersion: 1,
+    policyHistory: [
+      {
+        version: 1,
+        policy: draft.policy,
+        reason: "Исходное правило подтверждено пользователем.",
+        createdAt: now,
+      },
+    ],
+    semanticState: {
+      summary: draft.currentState,
+      updatedAt: draft.snapshot.fetchedAt,
+    },
     status: "ACTIVE",
     createdAt: now,
     stoppedAt: null,
@@ -884,13 +1488,14 @@ function createWatchFromDraft(
     lastSnapshot: draft.snapshot.text,
     lastNotificationFingerprint: null,
     pendingNotification: null,
+    lastDeliveredResult: null,
     consecutiveFailures: 0,
     lastCheckError: null,
     pageTitle: draft.snapshot.title,
   };
 }
 
-function formatPolicyPreview(snapshot: PageSnapshot, policy: WatchPolicy): string {
+function formatPolicyPreview(snapshot: PageSnapshot, policy: WatchPolicy, currentState: string): string {
   return [
     "Я понял задачу так:",
     "",
@@ -901,7 +1506,25 @@ function formatPolicyPreview(snapshot: PageSnapshot, policy: WatchPolicy): strin
     ...formatListBlock("На что обращать внимание:", policy.requiredSignals),
     ...formatListBlock("Что не учитывать:", policy.ignoredChanges),
     "",
+    "Сейчас на странице:",
+    currentState,
+    "",
     "Всё верно?",
+  ].join("\n");
+}
+
+function formatRefinedPolicyPreview(policy: WatchPolicy, explanation: string): string {
+  return [
+    "Я уточнил правило:",
+    "",
+    explanation,
+    "",
+    "Что отслеживаем:",
+    policy.targetEvent,
+    ...formatListBlock("На что обращать внимание:", policy.requiredSignals),
+    ...formatListBlock("Что не учитывать:", policy.ignoredChanges),
+    "",
+    "Сохранить новую версию?",
   ].join("\n");
 }
 
@@ -914,19 +1537,17 @@ function formatPageCard(watch: Watch): string {
     "",
     "Что отслеживаем:",
     truncate(watch.policy?.targetEvent ?? watch.instruction, 260),
-    "",
-    `Последняя проверка: ${formatDate(watch.lastCheckedAt)}`,
   ];
 
-  if (watch.status === "ACTIVE") {
-    lines.push(`Следующая проверка: ${formatDate(watch.nextCheckAt)}`);
+  if (watch.semanticState) {
+    lines.push("", "Сейчас на странице:", truncate(watch.semanticState.summary, 300));
   }
-  if (watch.pendingNotification) {
-    lines.push("Найденный результат ожидает доставки.");
-  }
-  if (watch.lastCheckError) {
-    lines.push(`Последняя ошибка: ${truncate(watch.lastCheckError, 160)}`);
-  }
+  lines.push("", `Версия правила: ${Math.max(1, watch.policyVersion)}`);
+  lines.push(`Последняя проверка: ${formatDate(watch.lastCheckedAt)}`);
+
+  if (watch.status === "ACTIVE") lines.push(`Следующая проверка: ${formatDate(watch.nextCheckAt)}`);
+  if (watch.pendingNotification) lines.push("Найденный результат ожидает доставки.");
+  if (watch.lastCheckError) lines.push(`Последняя ошибка: ${truncate(watch.lastCheckError, 160)}`);
   return lines.join("\n");
 }
 
@@ -980,6 +1601,18 @@ function policyConfirmationKeyboard(): InlineKeyboard {
     .text("Отмена", FLOW_CANCEL);
 }
 
+function policyClarificationKeyboard(options: string[]): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  options.forEach((option, index) => {
+    keyboard.text(truncate(option, 45), `policy:clarify:${index}`).row();
+  });
+  return keyboard
+    .text("Написать свой вариант", POLICY_CLARIFY_CUSTOM)
+    .row()
+    .text("Назад", FLOW_BACK)
+    .text("Отмена", FLOW_CANCEL);
+}
+
 function trackedPagesKeyboard(watches: Watch[]): InlineKeyboard {
   const keyboard = new InlineKeyboard();
   for (const watch of watches) {
@@ -1015,52 +1648,90 @@ function deleteConfirmationKeyboard(watchId: string): InlineKeyboard {
     .text("Отмена", `page:delete-cancel:${watchId}`);
 }
 
-function parseNotificationAction(data: string): NotificationAction | null {
-  const match = /^notification:(pause):([a-z0-9]+)$/.exec(data);
-  if (!match) return null;
-  const action = match[1];
-  const watchId = match[2];
-  if (action !== "pause" || !watchId) return null;
-  return { action, watchId };
+function feedbackReasonsKeyboard(resultId: string, reasons: FeedbackReason[]): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  reasons.forEach((reason, index) => {
+    keyboard.text(truncate(reason.label, 45), `feedback:reason:${resultId}:${index}`).row();
+  });
+  return keyboard
+    .text("Другая причина", `feedback:custom:${resultId}`)
+    .row()
+    .text("Отмена", `feedback:cancel:${resultId}`);
 }
 
-async function handleNotificationAction(
-  ctx: Context,
-  userId: string,
-  notificationAction: NotificationAction,
-  store: JsonStore,
-): Promise<void> {
-  const watch = await store.findTrackedWatch(userId, notificationAction.watchId);
-  if (!watch) {
-    await ctx.answerCallbackQuery({ text: "Страница не найдена.", show_alert: true });
-    return;
+function feedbackTextKeyboard(resultId: string): InlineKeyboard {
+  return new InlineKeyboard().text("Отмена", `feedback:cancel:${resultId}`);
+}
+
+function feedbackConfirmationKeyboard(resultId: string): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("Сохранить правило", `feedback:save:${resultId}`)
+    .row()
+    .text("Уточнить вручную", `feedback:edit:${resultId}`)
+    .text("Отмена", `feedback:cancel:${resultId}`);
+}
+
+function parseNotificationAction(data: string): NotificationAction | null {
+  const pause = /^notification:pause:([a-z0-9]+)$/.exec(data);
+  if (pause?.[1]) return { action: "pause", watchId: pause[1] };
+
+  const feedback = /^notification:(accept|reject):([a-z0-9]+):([a-z0-9]+)$/.exec(data);
+  if (!feedback?.[1] || !feedback[2] || !feedback[3]) return null;
+  return {
+    action: feedback[1] as "accept" | "reject",
+    watchId: feedback[2],
+    resultId: feedback[3],
+  };
+}
+
+function parseFeedbackAction(data: string): FeedbackAction | null {
+  const reason = /^feedback:reason:([a-z0-9]+):(\d+)$/.exec(data);
+  if (reason?.[1] && reason[2]) {
+    return { action: "reason", resultId: reason[1], index: Number(reason[2]) };
   }
+  const simple = /^feedback:(custom|save|edit|cancel):([a-z0-9]+)$/.exec(data);
+  if (!simple?.[1] || !simple[2]) return null;
+  return { action: simple[1] as "custom" | "save" | "edit" | "cancel", resultId: simple[2] };
+}
 
-  const paused = await store.pauseWatch(userId, watch.id);
-  await ctx.answerCallbackQuery({
-    text: paused ? "Отслеживание приостановлено" : "Уже приостановлено",
-  });
-
-  const chatId = ctx.chat?.id;
-  const messageId = getCallbackMessageId(ctx);
-  if (chatId === undefined || messageId === null) return;
-
-  try {
-    await ctx.api.editMessageReplyMarkup(chatId, messageId, {
-      reply_markup: new InlineKeyboard().url("Открыть страницу", watch.url),
-    });
-  } catch {
-    // Уведомление остаётся постоянным, даже если Telegram не смог обновить кнопки.
-  }
+function parsePolicyClarificationIndex(data: string): number | null {
+  const match = /^policy:clarify:(\d+)$/.exec(data);
+  return match?.[1] ? Number(match[1]) : null;
 }
 
 function parsePageAction(data: string): { action: PageAction; watchId: string } | null {
   const match = /^page:(view|check|pause|resume|delete|delete-confirm|delete-cancel):([a-z0-9]+)$/.exec(data);
-  if (!match) return null;
-  const action = match[1];
-  const watchId = match[2];
-  if (!action || !watchId) return null;
-  return { action: action as PageAction, watchId };
+  if (!match?.[1] || !match[2]) return null;
+  return { action: match[1] as PageAction, watchId: match[2] };
+}
+
+async function sendNewScreenBelowNotification(
+  ctx: Context,
+  userId: string,
+  screenMessages: ScreenMessageRegistry,
+  text: string,
+  keyboard: InlineKeyboard,
+): Promise<number> {
+  const chatId = ctx.chat?.id;
+  if (chatId === undefined) throw new Error("Telegram chat ID is unavailable.");
+
+  const previousScreenId = screenMessages.get(userId);
+  if (previousScreenId !== undefined) {
+    try {
+      await ctx.api.deleteMessage(chatId, previousScreenId);
+    } catch {
+      // Старый служебный экран мог быть уже удалён.
+    } finally {
+      screenMessages.delete(userId);
+    }
+  }
+
+  const message = await ctx.reply(text, {
+    reply_markup: keyboard,
+    link_preview_options: { is_disabled: true },
+  });
+  screenMessages.set(userId, message.message_id);
+  return message.message_id;
 }
 
 async function renderScreen(
@@ -1072,9 +1743,7 @@ async function renderScreen(
   preferredMessageId?: number,
 ): Promise<number> {
   const chatId = ctx.chat?.id;
-  if (chatId === undefined) {
-    throw new Error("Telegram chat ID is unavailable.");
-  }
+  if (chatId === undefined) throw new Error("Telegram chat ID is unavailable.");
 
   const callbackMessageId = getCallbackMessageId(ctx);
   const messageId = preferredMessageId ?? callbackMessageId ?? screenMessages.get(userId);
@@ -1084,14 +1753,12 @@ async function renderScreen(
   };
 
   if (messageId !== undefined) {
-    const separatedByPermanentMessage =
-      screenMessages.isSeparatedByPermanentMessage(userId, messageId);
-
-    if (separatedByPermanentMessage) {
+    const separated = screenMessages.isSeparatedByPermanentMessage(userId, messageId);
+    if (separated) {
       try {
         await ctx.api.deleteMessage(chatId, messageId);
       } catch {
-        // Старый UI-экран мог быть уже удалён пользователем или Telegram.
+        // Старый экран мог быть удалён пользователем.
       } finally {
         screenMessages.delete(userId);
       }
@@ -1105,7 +1772,6 @@ async function renderScreen(
           screenMessages.set(userId, messageId);
           return messageId;
         }
-        // Старое сообщение могло быть удалено или стать недоступным для редактирования.
       }
     }
   }
@@ -1120,7 +1786,7 @@ async function tryDeleteIncomingMessage(ctx: Context): Promise<void> {
   try {
     await ctx.deleteMessage();
   } catch {
-    // Удаление — только UX-оптимизация. Ошибка не должна ломать основной сценарий.
+    // Удаление — только UX-оптимизация.
   }
 }
 
@@ -1135,18 +1801,14 @@ function isMessageNotModifiedError(error: unknown): boolean {
 
 async function requireAccess(ctx: Context, accessService: AccessService): Promise<string | null> {
   const userId = getUserId(ctx);
-  if (await accessService.isAllowed(userId)) {
-    return userId;
-  }
+  if (await accessService.isAllowed(userId)) return userId;
   await ctx.reply(unauthorizedText(userId, accessService.isActivationEnabled()));
   return null;
 }
 
 function getUserId(ctx: Context): string {
   const id = ctx.from?.id;
-  if (!id) {
-    throw new Error("Telegram user ID is unavailable.");
-  }
+  if (!id) throw new Error("Telegram user ID is unavailable.");
   return String(id);
 }
 
@@ -1176,38 +1838,24 @@ function formatPolicyError(error: unknown): string {
       "Не удалось понять, что именно нужно отслеживать.",
       "",
       "Опишите задачу немного подробнее.",
-      "",
-      "Например: «Сообщи, когда откроется регистрация. Обновления программы и состава спикеров не учитывать».",
     ].join("\n");
   }
   if (error instanceof PolicyResponseError) {
     return [
       "Не удалось сформировать понятное правило.",
       "",
-      "Попробуйте переформулировать, что именно должно появиться или произойти на странице.",
+      "Попробуйте переформулировать задачу.",
     ].join("\n");
   }
-  return [
-    "Сервис временно не смог сформировать правило.",
-    "",
-    "Попробуйте ещё раз чуть позже или измените описание.",
-  ].join("\n");
+  return "Сервис временно не смог сформировать правило. Попробуйте ещё раз чуть позже.";
 }
 
 function formatPageLoadError(error: unknown): string {
   const raw = error instanceof Error ? error.message : "";
-  if (raw.includes("HTTP 403")) {
-    return "Сайт запретил автоматическую загрузку страницы (HTTP 403). Попробуйте другую публичную страницу.";
-  }
-  if (raw.includes("timed out")) {
-    return "Страница не ответила вовремя. Попробуйте ещё раз или отправьте другую ссылку.";
-  }
-  if (raw.includes("private or non-routable")) {
-    return "Этот адрес ведёт в локальную или закрытую сеть и не может быть проверен.";
-  }
-  if (raw.includes("Unsupported content type")) {
-    return "По ссылке нет поддерживаемой текстовой HTML-страницы.";
-  }
+  if (raw.includes("HTTP 403")) return "Сайт запретил автоматическую загрузку страницы (HTTP 403).";
+  if (raw.includes("timed out")) return "Страница не ответила вовремя. Попробуйте ещё раз.";
+  if (raw.includes("private or non-routable")) return "Этот адрес ведёт в локальную или закрытую сеть.";
+  if (raw.includes("Unsupported content type")) return "По ссылке нет поддерживаемой текстовой HTML-страницы.";
   return "Не удалось загрузить страницу. Проверьте ссылку и попробуйте ещё раз.";
 }
 
@@ -1226,7 +1874,7 @@ function welcomeText(): string {
   return [
     "Semantic Watch следит за нужной информацией на публичных веб-страницах.",
     "",
-    "Добавьте страницу, опишите, что должно на ней появиться, и сервис будет проверять её автоматически.",
+    "Добавьте страницу, опишите цель, и сервис будет проверять её автоматически.",
   ].join("\n");
 }
 
@@ -1236,11 +1884,11 @@ function helpText(): string {
     "",
     "1. Нажмите «Добавить страницу».",
     "2. Отправьте URL.",
-    "3. Опишите, что должно появиться или произойти.",
-    "4. Проверьте правило, которое сформировал AI, и подтвердите его.",
+    "3. Опишите, что нужно найти.",
+    "4. Ответьте на уточняющий вопрос, если задача неоднозначна.",
+    "5. Проверьте правило и подтвердите его.",
     "",
-    "В карточке страницы можно запустить проверку вручную, приостановить отслеживание или удалить страницу.",
-    "AI вызывается только при настройке правила и после реального обновления текста страницы.",
+    "После найденного результата можно подтвердить его или нажать «Не подходит». AI предложит уточнение правила, но сохранит его только после вашего подтверждения.",
   ].join("\n");
 }
 
@@ -1256,4 +1904,20 @@ function instructionPromptText(): string {
     "",
     "Например: «Сообщи, когда откроется регистрация. Обновления программы и состава спикеров не учитывать».",
   ].join("\n");
+}
+
+function fallbackFeedbackReasons(): FeedbackReason[] {
+  return [
+    { label: "Не та аудитория", clarification: "Информация относится не к той аудитории, которая мне нужна." },
+    { label: "Событие ещё не произошло", clarification: "Сообщать только когда действие действительно станет доступно, а не будет только анонсировано." },
+    { label: "Такие результаты неинтересны", clarification: "Исключить результаты такого типа из дальнейшего отслеживания." },
+  ];
+}
+
+function fallbackPolicy(watch: Watch): WatchPolicy {
+  return {
+    targetEvent: watch.instruction,
+    requiredSignals: [watch.instruction],
+    ignoredChanges: [],
+  };
 }

@@ -2,9 +2,12 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type {
   AuthorizedUser,
+  DeliveredResult,
   LlmUsage,
   PageSnapshot,
   PendingNotification,
+  PolicyRevision,
+  SemanticState,
   StoreData,
   Watch,
   WatchPolicy,
@@ -54,9 +57,7 @@ export class JsonStore {
 
   async authorize(telegramUserId: string): Promise<void> {
     await this.mutate((store) => {
-      if (store.authorizedUsers.some((user) => user.telegramUserId === telegramUserId)) {
-        return;
-      }
+      if (store.authorizedUsers.some((user) => user.telegramUserId === telegramUserId)) return;
       const user: AuthorizedUser = {
         telegramUserId,
         activatedAt: new Date().toISOString(),
@@ -175,7 +176,81 @@ export class JsonStore {
           item.status === "ACTIVE",
       );
       if (!watch) return;
+
       watch.policy = policy;
+      if (watch.policyHistory.length === 0) {
+        watch.policyVersion = Math.max(1, watch.policyVersion);
+        watch.policyHistory.push({
+          version: watch.policyVersion,
+          policy,
+          reason: "Правило восстановлено для записи предыдущей версии приложения.",
+          createdAt: new Date().toISOString(),
+        });
+      }
+      updated = true;
+    });
+    return updated;
+  }
+
+  async applyRefinedPolicy(options: {
+    telegramUserId: string;
+    watchId: string;
+    resultId: string;
+    policy: WatchPolicy;
+    reason: string;
+  }): Promise<boolean> {
+    let updated = false;
+    await this.mutate((store) => {
+      const watch = store.watches.find(
+        (item) =>
+          item.id === options.watchId &&
+          item.ownerTelegramId === options.telegramUserId &&
+          item.status !== "STOPPED",
+      );
+      const result = watch?.lastDeliveredResult;
+      if (!watch || !result || result.id !== options.resultId) return;
+
+      const version = Math.max(1, watch.policyVersion) + 1;
+      const revision: PolicyRevision = {
+        version,
+        policy: options.policy,
+        reason: options.reason,
+        createdAt: new Date().toISOString(),
+      };
+
+      watch.policy = options.policy;
+      watch.policyVersion = version;
+      watch.policyHistory.push(revision);
+      watch.lastDeliveredResult = {
+        ...result,
+        feedbackStatus: "REJECTED",
+        feedbackReason: options.reason,
+      };
+      updated = true;
+    });
+    return updated;
+  }
+
+  async confirmDeliveredResult(options: {
+    telegramUserId: string;
+    watchId: string;
+    resultId: string;
+  }): Promise<boolean> {
+    let updated = false;
+    await this.mutate((store) => {
+      const watch = store.watches.find(
+        (item) =>
+          item.id === options.watchId &&
+          item.ownerTelegramId === options.telegramUserId &&
+          item.status !== "STOPPED",
+      );
+      const result = watch?.lastDeliveredResult;
+      if (!watch || !result || result.id !== options.resultId) return;
+      watch.lastDeliveredResult = {
+        ...result,
+        feedbackStatus: "CONFIRMED",
+        feedbackReason: null,
+      };
       updated = true;
     });
     return updated;
@@ -187,6 +262,7 @@ export class JsonStore {
     expectedPreviousHash: string;
     snapshot: PageSnapshot;
     nextCheckAt: string;
+    semanticStateSummary: string;
     pendingNotification?: PendingNotification;
   }): Promise<boolean> {
     let updated = false;
@@ -197,9 +273,7 @@ export class JsonStore {
           item.ownerTelegramId === options.telegramUserId &&
           item.status === "ACTIVE",
       );
-      if (!watch || watch.lastContentHash !== options.expectedPreviousHash) {
-        return;
-      }
+      if (!watch || watch.lastContentHash !== options.expectedPreviousHash) return;
 
       watch.url = options.snapshot.finalUrl;
       watch.pageTitle = options.snapshot.title;
@@ -207,6 +281,10 @@ export class JsonStore {
       watch.nextCheckAt = options.nextCheckAt;
       watch.lastContentHash = options.snapshot.hash;
       watch.lastSnapshot = options.snapshot.text;
+      watch.semanticState = {
+        summary: options.semanticStateSummary,
+        updatedAt: options.snapshot.fetchedAt,
+      };
       watch.consecutiveFailures = 0;
       watch.lastCheckError = null;
       watch.pendingNotification = options.pendingNotification ?? null;
@@ -276,8 +354,21 @@ export class JsonStore {
           item.ownerTelegramId === options.telegramUserId &&
           item.status === "ACTIVE",
       );
-      if (!watch || watch.pendingNotification?.fingerprint !== options.fingerprint) return;
+      const pending = watch?.pendingNotification;
+      if (!watch || !pending || pending.fingerprint !== options.fingerprint) return;
+
+      const delivered: DeliveredResult = {
+        id: pending.id,
+        fingerprint: pending.fingerprint,
+        summary: pending.summary,
+        evidence: pending.evidence,
+        createdAt: pending.createdAt,
+        deliveredAt: new Date().toISOString(),
+        feedbackStatus: "PENDING",
+        feedbackReason: null,
+      };
       watch.lastNotificationFingerprint = options.fingerprint;
+      watch.lastDeliveredResult = delivered;
       watch.pendingNotification = null;
       updated = true;
     });
@@ -413,18 +504,81 @@ export class JsonStore {
 function normalizeWatch(value: Watch): Watch {
   const fallbackCheckTime =
     typeof value.lastCheckedAt === "string" ? value.lastCheckedAt : new Date(0).toISOString();
+  const policy = normalizePolicy(value.policy);
+  const policyVersion = Number.isInteger(value.policyVersion)
+    ? Math.max(policy ? 1 : 0, value.policyVersion)
+    : policy
+      ? 1
+      : 0;
+  const policyHistory = normalizePolicyHistory(value.policyHistory, policy, policyVersion, value.createdAt);
 
   return {
     ...value,
     status: normalizeWatchStatus(value.status),
-    policy: value.policy ?? null,
+    policy,
+    policyVersion,
+    policyHistory,
+    semanticState: normalizeSemanticState(value.semanticState),
     lastNotificationFingerprint: value.lastNotificationFingerprint ?? null,
     pendingNotification: normalizePendingNotification(value.pendingNotification),
+    lastDeliveredResult: normalizeDeliveredResult(value.lastDeliveredResult),
     nextCheckAt: value.nextCheckAt ?? fallbackCheckTime,
     consecutiveFailures: Number.isInteger(value.consecutiveFailures)
       ? Math.max(0, value.consecutiveFailures)
       : 0,
     lastCheckError: value.lastCheckError ?? null,
+  };
+}
+
+function normalizePolicy(value: WatchPolicy | null | undefined): WatchPolicy | null {
+  if (!value || typeof value.targetEvent !== "string") return null;
+  return {
+    targetEvent: value.targetEvent,
+    requiredSignals: Array.isArray(value.requiredSignals)
+      ? value.requiredSignals.filter((item) => typeof item === "string")
+      : [],
+    ignoredChanges: Array.isArray(value.ignoredChanges)
+      ? value.ignoredChanges.filter((item) => typeof item === "string")
+      : [],
+  };
+}
+
+function normalizePolicyHistory(
+  value: PolicyRevision[] | undefined,
+  policy: WatchPolicy | null,
+  version: number,
+  createdAt: string,
+): PolicyRevision[] {
+  if (Array.isArray(value) && value.length > 0) {
+    return value.flatMap((item) => {
+      const normalizedPolicy = normalizePolicy(item.policy);
+      if (!normalizedPolicy || !Number.isInteger(item.version)) return [];
+      return [
+        {
+          version: Math.max(1, item.version),
+          policy: normalizedPolicy,
+          reason: typeof item.reason === "string" ? item.reason : "Правило обновлено.",
+          createdAt: typeof item.createdAt === "string" ? item.createdAt : createdAt,
+        },
+      ];
+    });
+  }
+  if (!policy) return [];
+  return [
+    {
+      version: Math.max(1, version),
+      policy,
+      reason: "Исходное правило отслеживания.",
+      createdAt,
+    },
+  ];
+}
+
+function normalizeSemanticState(value: SemanticState | null | undefined): SemanticState | null {
+  if (!value || typeof value.summary !== "string") return null;
+  return {
+    summary: value.summary,
+    updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : new Date().toISOString(),
   };
 }
 
@@ -438,15 +592,40 @@ function normalizePendingNotification(
 ): PendingNotification | null {
   if (!value || typeof value.fingerprint !== "string") return null;
   return {
+    id:
+      typeof value.id === "string" && value.id.length > 0
+        ? value.id
+        : value.fingerprint.replace(/[^a-z0-9]/gi, "").slice(0, 12),
     fingerprint: value.fingerprint,
-    summary: typeof value.summary === "string" ? value.summary : "Страница изменилась.",
-    evidence: Array.isArray(value.evidence) ? value.evidence.filter((item) => typeof item === "string") : [],
+    summary: typeof value.summary === "string" ? value.summary : "На странице найдена информация.",
+    evidence: Array.isArray(value.evidence)
+      ? value.evidence.filter((item) => typeof item === "string")
+      : [],
     createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date().toISOString(),
     nextAttemptAt:
       typeof value.nextAttemptAt === "string" ? value.nextAttemptAt : new Date().toISOString(),
     attempts: Number.isInteger(value.attempts) ? Math.max(0, value.attempts) : 0,
     lastAttemptAt: typeof value.lastAttemptAt === "string" ? value.lastAttemptAt : null,
     lastError: typeof value.lastError === "string" ? value.lastError : null,
+  };
+}
+
+function normalizeDeliveredResult(value: DeliveredResult | null | undefined): DeliveredResult | null {
+  if (!value || typeof value.id !== "string" || typeof value.fingerprint !== "string") return null;
+  return {
+    id: value.id,
+    fingerprint: value.fingerprint,
+    summary: typeof value.summary === "string" ? value.summary : "На странице найдена информация.",
+    evidence: Array.isArray(value.evidence)
+      ? value.evidence.filter((item) => typeof item === "string")
+      : [],
+    createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date().toISOString(),
+    deliveredAt: typeof value.deliveredAt === "string" ? value.deliveredAt : new Date().toISOString(),
+    feedbackStatus:
+      value.feedbackStatus === "CONFIRMED" || value.feedbackStatus === "REJECTED"
+        ? value.feedbackStatus
+        : "PENDING",
+    feedbackReason: typeof value.feedbackReason === "string" ? value.feedbackReason : null,
   };
 }
 

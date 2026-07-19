@@ -1,10 +1,10 @@
+import { SemanticEvaluator } from "../ai/semantic-evaluator.js";
 import type { PendingNotification, SemanticEvaluation, Watch } from "../domain/models.js";
 import { SafePageFetcher } from "../fetcher/safe-page-fetcher.js";
 import { JsonStore } from "../storage/json-store.js";
 import { sha256 } from "../utils/hash.js";
 import { buildTextDiff } from "../utils/text-diff.js";
 import { addMinutesIso } from "../utils/time.js";
-import { SemanticEvaluator } from "../ai/semantic-evaluator.js";
 
 export type WatchCheckResult =
   | { kind: "UNCHANGED"; watch: Watch }
@@ -81,6 +81,7 @@ export class WatchCheckService {
     const evaluation = await this.semanticEvaluator.evaluateChange({
       instruction: watch.instruction,
       policy,
+      previousState: watch.semanticState?.summary ?? null,
       diff,
     });
 
@@ -99,6 +100,7 @@ export class WatchCheckService {
 
       if (!duplicate) {
         pendingNotification = {
+          id: notificationFingerprint.slice(0, 12),
           fingerprint: notificationFingerprint,
           summary: evaluation.summary,
           evidence: evaluation.evidence,
@@ -117,6 +119,7 @@ export class WatchCheckService {
       expectedPreviousHash: watch.lastContentHash,
       snapshot,
       nextCheckAt,
+      semanticStateSummary: evaluation.currentState,
       ...(pendingNotification ? { pendingNotification } : {}),
     });
     if (!updated) {
@@ -125,12 +128,17 @@ export class WatchCheckService {
 
     const updatedWatch: Watch = {
       ...watch,
+      policy,
       url: snapshot.finalUrl,
       pageTitle: snapshot.title,
       lastCheckedAt: snapshot.fetchedAt,
       nextCheckAt,
       lastContentHash: snapshot.hash,
       lastSnapshot: snapshot.text,
+      semanticState: {
+        summary: evaluation.currentState,
+        updatedAt: snapshot.fetchedAt,
+      },
       consecutiveFailures: 0,
       lastCheckError: null,
       pendingNotification: pendingNotification ?? null,

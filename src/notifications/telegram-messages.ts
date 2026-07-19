@@ -1,5 +1,5 @@
 import { InlineKeyboard } from "grammy";
-import type { SemanticEvaluation, Watch } from "../domain/models.js";
+import type { PendingNotification, SemanticEvaluation, Watch } from "../domain/models.js";
 
 export function formatImportantChange(
   watch: Pick<Watch, "url">,
@@ -22,9 +22,23 @@ export function formatImportantChange(
 
 export function importantNotificationKeyboard(
   watch: Pick<Watch, "id" | "url">,
+  result: Pick<PendingNotification, "id">,
 ): InlineKeyboard {
   return new InlineKeyboard()
+    .text("Да, это оно", `notification:accept:${watch.id}:${result.id}`)
+    .text("Не подходит", `notification:reject:${watch.id}:${result.id}`)
+    .row()
     .url("Открыть страницу", watch.url)
     .row()
     .text("Приостановить отслеживание", `notification:pause:${watch.id}`);
+}
+
+export function resolvedNotificationKeyboard(
+  watch: Pick<Watch, "id" | "url" | "status">,
+): InlineKeyboard {
+  const keyboard = new InlineKeyboard().url("Открыть страницу", watch.url);
+  if (watch.status === "ACTIVE") {
+    keyboard.row().text("Приостановить отслеживание", `notification:pause:${watch.id}`);
+  }
+  return keyboard;
 }

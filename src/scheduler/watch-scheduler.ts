@@ -110,7 +110,7 @@ export class WatchScheduler {
           formatImportantChange(item.watch, item.notification),
           {
             link_preview_options: { is_disabled: true },
-            reply_markup: importantNotificationKeyboard(item.watch),
+            reply_markup: importantNotificationKeyboard(item.watch, item.notification),
           },
         );
         this.screenMessages.markSeparatedByPermanentMessage(item.watch.ownerTelegramId);
