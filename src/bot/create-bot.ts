@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { Bot, InlineKeyboard, Keyboard, type Context } from "grammy";
-import type { SemanticEvaluator } from "../ai/semantic-evaluator.js";
+import {
+  PolicyNotUnderstoodError,
+  PolicyResponseError,
+  type SemanticEvaluator,
+} from "../ai/semantic-evaluator.js";
 import {
   WatchCheckInProgressError,
   type WatchCheckResult,
@@ -9,10 +13,7 @@ import {
 import type { AppConfig } from "../config/config.js";
 import type { PageSnapshot, Watch, WatchPolicy } from "../domain/models.js";
 import { SafePageFetcher } from "../fetcher/safe-page-fetcher.js";
-import {
-  formatImportantChange,
-  importantNotificationKeyboard,
-} from "../notifications/telegram-messages.js";
+import { formatImportantChange } from "../notifications/telegram-messages.js";
 import { JsonStore } from "../storage/json-store.js";
 import { normalizeInstruction, truncate } from "../utils/text.js";
 import { addMinutesIso } from "../utils/time.js";
@@ -27,16 +28,20 @@ const FLOW_BACK = "flow:back";
 const FLOW_CONFIRM = "flow:confirm";
 const FLOW_REFINE = "flow:refine";
 
-interface WaitingUrl {
+interface PendingBase {
+  screenMessageId: number;
+}
+
+interface WaitingUrl extends PendingBase {
   step: "WAITING_URL";
 }
 
-interface WaitingInstruction {
+interface WaitingInstruction extends PendingBase {
   step: "WAITING_INSTRUCTION";
   url: string;
 }
 
-interface WaitingConfirmation {
+interface WaitingConfirmation extends PendingBase {
   step: "WAITING_CONFIRMATION";
   url: string;
   instruction: string;
@@ -45,6 +50,15 @@ interface WaitingConfirmation {
 }
 
 type PendingWatch = WaitingUrl | WaitingInstruction | WaitingConfirmation;
+
+type PageAction =
+  | "view"
+  | "check"
+  | "pause"
+  | "resume"
+  | "delete"
+  | "delete-confirm"
+  | "delete-cancel";
 
 export function createBot(
   appConfig: AppConfig,
@@ -56,96 +70,129 @@ export function createBot(
   const bot = new Bot(appConfig.telegramBotToken);
   const accessService = new AccessService(appConfig, store);
   const pendingWatches = new Map<string, PendingWatch>();
+  const screenMessages = new Map<string, number>();
 
   bot.command("start", async (ctx) => {
+    await tryDeleteIncomingMessage(ctx);
     const userId = getUserId(ctx);
-    if (await accessService.isAllowed(userId)) {
-      await ctx.reply(welcomeText(), { reply_markup: mainMenuKeyboard() });
+    if (!(await accessService.isAllowed(userId))) {
+      const message = await ctx.reply(unauthorizedText(userId, accessService.isActivationEnabled()));
+      screenMessages.set(userId, message.message_id);
       return;
     }
-    await ctx.reply(unauthorizedText(userId, accessService.isActivationEnabled()));
+
+    const message = await ctx.reply(welcomeText(), { reply_markup: mainMenuKeyboard() });
+    screenMessages.set(userId, message.message_id);
   });
 
   bot.command("activate", async (ctx) => {
     const userId = getUserId(ctx);
+    const key = ctx.match.trim();
+    // Ключ не должен оставаться в истории Telegram.
+    await tryDeleteIncomingMessage(ctx);
+
     if (await accessService.isAllowed(userId)) {
-      await ctx.reply("Доступ уже активирован.", { reply_markup: mainMenuKeyboard() });
+      const message = await ctx.reply("Доступ уже активирован.", {
+        reply_markup: mainMenuKeyboard(),
+      });
+      screenMessages.set(userId, message.message_id);
       return;
     }
     if (!accessService.isActivationEnabled()) {
-      await ctx.reply("Активация по ключу отключена.");
+      const message = await ctx.reply("Активация по ключу отключена.");
+      screenMessages.set(userId, message.message_id);
       return;
     }
-
-    const key = ctx.match.trim();
     if (!key) {
-      await ctx.reply("Использование: /activate <ключ>");
+      const message = await ctx.reply("Использование: /activate <ключ>");
+      screenMessages.set(userId, message.message_id);
       return;
     }
 
     const activated = await accessService.activate(userId, key);
     if (!activated) {
-      await ctx.reply("Неверный ключ доступа.");
+      const message = await ctx.reply("Неверный ключ доступа.");
+      screenMessages.set(userId, message.message_id);
       return;
     }
 
-    await ctx.reply("Доступ активирован. Можно добавить первую страницу.", {
+    const message = await ctx.reply("Доступ активирован. Можно добавить первую страницу.", {
       reply_markup: mainMenuKeyboard(),
     });
+    screenMessages.set(userId, message.message_id);
   });
 
   bot.command("watch", async (ctx) => {
     const userId = await requireAccess(ctx, accessService);
     if (!userId) return;
-    await startAddPage(ctx, userId, pendingWatches, store, appConfig);
+    await tryDeleteIncomingMessage(ctx);
+    await startAddPage(ctx, userId, pendingWatches, screenMessages, store, appConfig);
   });
 
   bot.command("list", async (ctx) => {
     const userId = await requireAccess(ctx, accessService);
     if (!userId) return;
-    await showTrackedPages(ctx, userId, store);
+    await tryDeleteIncomingMessage(ctx);
+    pendingWatches.delete(userId);
+    await showTrackedPages(ctx, userId, store, screenMessages);
   });
 
   bot.command("check", async (ctx) => {
     const userId = await requireAccess(ctx, accessService);
     if (!userId) return;
+    await tryDeleteIncomingMessage(ctx);
 
     const resolved = await resolveWatchForCommandCheck(store, userId, ctx.match.trim());
     if (typeof resolved === "string") {
-      await ctx.reply(resolved, { reply_markup: mainMenuKeyboard() });
+      await renderScreen(ctx, userId, screenMessages, resolved, mainNavigationKeyboard());
       return;
     }
-    await checkPageAndReply(ctx, userId, resolved, store, checkService);
+    await checkPageAndRender(ctx, userId, resolved, store, checkService, screenMessages);
   });
 
   // Команда оставлена для совместимости. В основном интерфейсе удаление выполняется кнопкой.
   bot.command("stop", async (ctx) => {
     const userId = await requireAccess(ctx, accessService);
     if (!userId) return;
+    await tryDeleteIncomingMessage(ctx);
 
     const watchId = ctx.match.trim();
     if (!watchId) {
-      await ctx.reply("Откройте «Отслеживаемые страницы» и нажмите «Удалить».", {
-        reply_markup: mainMenuKeyboard(),
-      });
+      await renderScreen(
+        ctx,
+        userId,
+        screenMessages,
+        "Откройте «Отслеживаемые страницы» и нажмите «Удалить».",
+        mainNavigationKeyboard(),
+      );
       return;
     }
 
     const deleted = await store.deleteWatch(userId, watchId);
-    await ctx.reply(
+    await renderScreen(
+      ctx,
+      userId,
+      screenMessages,
       deleted ? "Страница удалена из отслеживания." : "Страница не найдена.",
-      { reply_markup: mainMenuKeyboard() },
+      mainNavigationKeyboard(),
     );
   });
 
   bot.command("cancel", async (ctx) => {
     const userId = await requireAccess(ctx, accessService);
     if (!userId) return;
+    await tryDeleteIncomingMessage(ctx);
 
-    const existed = pendingWatches.delete(userId);
-    await ctx.reply(existed ? "Настройка отменена." : "Сейчас нет незавершённой настройки.", {
-      reply_markup: mainMenuKeyboard(),
-    });
+    const pending = pendingWatches.get(userId);
+    pendingWatches.delete(userId);
+    await renderScreen(
+      ctx,
+      userId,
+      screenMessages,
+      pending ? "Настройка отменена." : "Сейчас нет незавершённой настройки.",
+      mainNavigationKeyboard(),
+      pending?.screenMessageId,
+    );
   });
 
   bot.on("callback_query:data", async (ctx) => {
@@ -155,57 +202,104 @@ export function createBot(
       return;
     }
 
+    const callbackMessageId = getCallbackMessageId(ctx);
+    if (callbackMessageId !== null) {
+      screenMessages.set(userId, callbackMessageId);
+    }
+
     const data = ctx.callbackQuery.data;
 
     if (data === FLOW_CANCEL) {
+      const pending = pendingWatches.get(userId);
       pendingWatches.delete(userId);
       await ctx.answerCallbackQuery({ text: "Настройка отменена" });
-      await removeInlineKeyboard(ctx);
-      await ctx.reply("Настройка страницы отменена.", { reply_markup: mainMenuKeyboard() });
+      await renderScreen(
+        ctx,
+        userId,
+        screenMessages,
+        "Настройка отменена.",
+        mainNavigationKeyboard(),
+        pending?.screenMessageId ?? callbackMessageId ?? undefined,
+      );
       return;
     }
 
     if (data === FLOW_BACK) {
       await ctx.answerCallbackQuery();
-      await removeInlineKeyboard(ctx);
       const pending = pendingWatches.get(userId);
       if (!pending) {
-        await ctx.reply("Черновик настройки не найден. Начните заново.", {
-          reply_markup: mainMenuKeyboard(),
-        });
+        await renderScreen(
+          ctx,
+          userId,
+          screenMessages,
+          "Черновик настройки не найден. Начните заново.",
+          mainNavigationKeyboard(),
+          callbackMessageId ?? undefined,
+        );
         return;
       }
 
       if (pending.step === "WAITING_CONFIRMATION") {
-        pendingWatches.set(userId, { step: "WAITING_INSTRUCTION", url: pending.url });
-        await askForInstruction(ctx);
+        const next: WaitingInstruction = {
+          step: "WAITING_INSTRUCTION",
+          url: pending.url,
+          screenMessageId: pending.screenMessageId,
+        };
+        pendingWatches.set(userId, next);
+        await askForInstruction(ctx, userId, screenMessages, next.screenMessageId);
         return;
       }
 
       if (pending.step === "WAITING_INSTRUCTION") {
-        pendingWatches.set(userId, { step: "WAITING_URL" });
-        await askForUrl(ctx);
+        const next: WaitingUrl = {
+          step: "WAITING_URL",
+          screenMessageId: pending.screenMessageId,
+        };
+        pendingWatches.set(userId, next);
+        await askForUrl(ctx, userId, screenMessages, next.screenMessageId);
         return;
       }
 
-      await ctx.reply("Это первый шаг настройки.", { reply_markup: flowCancelKeyboard() });
+      await renderScreen(
+        ctx,
+        userId,
+        screenMessages,
+        "Это первый шаг настройки.",
+        flowCancelKeyboard(),
+        pending.screenMessageId,
+      );
       return;
     }
 
     if (data === FLOW_REFINE) {
       await ctx.answerCallbackQuery();
-      await removeInlineKeyboard(ctx);
       const pending = pendingWatches.get(userId);
       if (!pending || pending.step !== "WAITING_CONFIRMATION") {
-        await ctx.reply("Черновик настройки не найден. Начните заново.", {
-          reply_markup: mainMenuKeyboard(),
-        });
+        await renderScreen(
+          ctx,
+          userId,
+          screenMessages,
+          "Черновик настройки не найден. Начните заново.",
+          mainNavigationKeyboard(),
+          callbackMessageId ?? undefined,
+        );
         return;
       }
-      pendingWatches.set(userId, { step: "WAITING_INSTRUCTION", url: pending.url });
-      await ctx.reply("Опишите задачу заново. Я сформирую новое правило.", {
-        reply_markup: instructionNavigationKeyboard(),
-      });
+
+      const next: WaitingInstruction = {
+        step: "WAITING_INSTRUCTION",
+        url: pending.url,
+        screenMessageId: pending.screenMessageId,
+      };
+      pendingWatches.set(userId, next);
+      await renderScreen(
+        ctx,
+        userId,
+        screenMessages,
+        "Опишите задачу заново. Я сформирую новое правило.",
+        instructionNavigationKeyboard(),
+        next.screenMessageId,
+      );
       return;
     }
 
@@ -213,18 +307,26 @@ export function createBot(
       await ctx.answerCallbackQuery({ text: "Сохраняю" });
       const pending = pendingWatches.get(userId);
       if (!pending || pending.step !== "WAITING_CONFIRMATION") {
-        await removeInlineKeyboard(ctx);
-        await ctx.reply("Черновик настройки не найден. Начните заново.", {
-          reply_markup: mainMenuKeyboard(),
-        });
+        await renderScreen(
+          ctx,
+          userId,
+          screenMessages,
+          "Черновик настройки не найден. Начните заново.",
+          mainNavigationKeyboard(),
+          callbackMessageId ?? undefined,
+        );
         return;
       }
 
       const trackedCount = await store.countTrackedWatches(userId);
       if (trackedCount >= appConfig.maxActiveWatchesPerUser) {
-        await ctx.reply(
+        await renderScreen(
+          ctx,
+          userId,
+          screenMessages,
           `Достигнут лимит отслеживаемых страниц: ${appConfig.maxActiveWatchesPerUser}.`,
-          { reply_markup: mainMenuKeyboard() },
+          mainNavigationKeyboard(),
+          pending.screenMessageId,
         );
         return;
       }
@@ -232,21 +334,20 @@ export function createBot(
       const watch = createWatchFromDraft(userId, pending, appConfig.defaultCheckIntervalMinutes);
       await store.createWatch(watch);
       pendingWatches.delete(userId);
-      await removeInlineKeyboard(ctx);
-      await ctx.reply("Отслеживание настроено.", { reply_markup: mainMenuKeyboard() });
-      await sendPageCard(ctx, watch);
+      await renderPageCard(ctx, userId, watch, screenMessages, pending.screenMessageId);
       return;
     }
 
     if (data === "nav:add") {
       await ctx.answerCallbackQuery();
-      await startAddPage(ctx, userId, pendingWatches, store, appConfig);
+      await startAddPage(ctx, userId, pendingWatches, screenMessages, store, appConfig);
       return;
     }
 
     if (data === "nav:list") {
       await ctx.answerCallbackQuery();
-      await showTrackedPages(ctx, userId, store);
+      pendingWatches.delete(userId);
+      await showTrackedPages(ctx, userId, store, screenMessages);
       return;
     }
 
@@ -259,18 +360,23 @@ export function createBot(
     const watch = await store.findTrackedWatch(userId, pageAction.watchId);
     if (!watch) {
       await ctx.answerCallbackQuery({ text: "Страница не найдена.", show_alert: true });
-      await removeInlineKeyboard(ctx);
+      await showTrackedPages(ctx, userId, store, screenMessages);
       return;
     }
 
     switch (pageAction.action) {
+      case "view": {
+        await ctx.answerCallbackQuery();
+        await renderPageCard(ctx, userId, watch, screenMessages, callbackMessageId ?? undefined);
+        return;
+      }
       case "check": {
         if (watch.status !== "ACTIVE") {
           await ctx.answerCallbackQuery({ text: "Сначала возобновите отслеживание." });
           return;
         }
         await ctx.answerCallbackQuery({ text: "Проверяю" });
-        await checkPageAndReply(ctx, userId, watch, store, checkService);
+        await checkPageAndRender(ctx, userId, watch, store, checkService, screenMessages);
         return;
       }
       case "pause": {
@@ -278,9 +384,10 @@ export function createBot(
         await ctx.answerCallbackQuery({
           text: paused ? "Отслеживание приостановлено" : "Уже приостановлено",
         });
-        await removeInlineKeyboard(ctx);
         const updated = await store.findTrackedWatch(userId, watch.id);
-        if (updated) await sendPageCard(ctx, updated);
+        if (updated) {
+          await renderPageCard(ctx, userId, updated, screenMessages, callbackMessageId ?? undefined);
+        }
         return;
       }
       case "resume": {
@@ -288,29 +395,41 @@ export function createBot(
         await ctx.answerCallbackQuery({
           text: resumed ? "Отслеживание возобновлено" : "Страница уже активна",
         });
-        await removeInlineKeyboard(ctx);
         const updated = await store.findTrackedWatch(userId, watch.id);
-        if (updated) await sendPageCard(ctx, updated);
+        if (updated) {
+          await renderPageCard(ctx, userId, updated, screenMessages, callbackMessageId ?? undefined);
+        }
         return;
       }
       case "delete": {
         await ctx.answerCallbackQuery();
-        await ctx.editMessageReplyMarkup({ reply_markup: deleteConfirmationKeyboard(watch.id) });
+        await renderScreen(
+          ctx,
+          userId,
+          screenMessages,
+          `Удалить страницу «${pageTitle(watch)}» из отслеживания?`,
+          deleteConfirmationKeyboard(watch.id),
+          callbackMessageId ?? undefined,
+        );
         return;
       }
       case "delete-cancel": {
         await ctx.answerCallbackQuery({ text: "Удаление отменено" });
-        await ctx.editMessageReplyMarkup({ reply_markup: pageCardKeyboard(watch) });
+        await renderPageCard(ctx, userId, watch, screenMessages, callbackMessageId ?? undefined);
         return;
       }
       case "delete-confirm": {
         const deleted = await store.deleteWatch(userId, watch.id);
         await ctx.answerCallbackQuery({ text: deleted ? "Страница удалена" : "Страница не найдена" });
-        await ctx.editMessageText(
+        await renderScreen(
+          ctx,
+          userId,
+          screenMessages,
           deleted
             ? `Страница «${pageTitle(watch)}» удалена из отслеживания.`
             : "Не удалось удалить страницу.",
-          { reply_markup: new InlineKeyboard().text("К списку страниц", "nav:list") },
+          mainNavigationKeyboard(),
+          callbackMessageId ?? undefined,
         );
         return;
       }
@@ -322,84 +441,158 @@ export function createBot(
     if (!userId) return;
 
     const text = ctx.message.text.trim();
+    await tryDeleteIncomingMessage(ctx);
+
     if (text === MENU_ADD_PAGE) {
-      await startAddPage(ctx, userId, pendingWatches, store, appConfig);
+      await startAddPage(ctx, userId, pendingWatches, screenMessages, store, appConfig);
       return;
     }
     if (text === MENU_TRACKED_PAGES) {
       pendingWatches.delete(userId);
-      await showTrackedPages(ctx, userId, store);
+      await showTrackedPages(ctx, userId, store, screenMessages);
       return;
     }
     if (text === MENU_HELP) {
-      await ctx.reply(helpText(), { reply_markup: mainMenuKeyboard() });
+      pendingWatches.delete(userId);
+      await renderScreen(ctx, userId, screenMessages, helpText(), mainNavigationKeyboard());
       return;
     }
 
     const pending = pendingWatches.get(userId);
     if (!pending) {
-      await ctx.reply("Выберите действие в меню.", { reply_markup: mainMenuKeyboard() });
+      await renderScreen(
+        ctx,
+        userId,
+        screenMessages,
+        "Выберите действие в меню.",
+        mainNavigationKeyboard(),
+      );
       return;
     }
 
     if (pending.step === "WAITING_URL") {
       try {
         const normalized = new URL(text).toString();
-        pendingWatches.set(userId, { step: "WAITING_INSTRUCTION", url: normalized });
-        await askForInstruction(ctx);
+        const next: WaitingInstruction = {
+          step: "WAITING_INSTRUCTION",
+          url: normalized,
+          screenMessageId: pending.screenMessageId,
+        };
+        pendingWatches.set(userId, next);
+        await askForInstruction(ctx, userId, screenMessages, next.screenMessageId);
       } catch {
-        await ctx.reply(
+        await renderScreen(
+          ctx,
+          userId,
+          screenMessages,
           "Не удалось распознать ссылку. Отправьте полный URL, начинающийся с http:// или https://.",
-          { reply_markup: flowCancelKeyboard() },
+          flowCancelKeyboard(),
+          pending.screenMessageId,
         );
       }
       return;
     }
 
     if (pending.step === "WAITING_CONFIRMATION") {
-      await ctx.reply("Подтвердите правило кнопкой или выберите «Уточнить».", {
-        reply_markup: policyConfirmationKeyboard(),
-      });
+      await renderScreen(
+        ctx,
+        userId,
+        screenMessages,
+        formatPolicyPreview(pending.snapshot, pending.policy),
+        policyConfirmationKeyboard(),
+        pending.screenMessageId,
+      );
       return;
     }
 
     const instruction = normalizeInstruction(text);
     if (instruction.length < 8) {
-      await ctx.reply("Описание слишком короткое. Уточните, что должно появиться или произойти.", {
-        reply_markup: instructionNavigationKeyboard(),
-      });
+      await renderScreen(
+        ctx,
+        userId,
+        screenMessages,
+        "Описание слишком короткое. Уточните, что должно появиться или произойти.",
+        instructionNavigationKeyboard(),
+        pending.screenMessageId,
+      );
       return;
     }
     if (instruction.length > 2000) {
-      await ctx.reply("Описание слишком длинное. Максимум 2000 символов.", {
-        reply_markup: instructionNavigationKeyboard(),
-      });
+      await renderScreen(
+        ctx,
+        userId,
+        screenMessages,
+        "Описание слишком длинное. Максимум 2000 символов.",
+        instructionNavigationKeyboard(),
+        pending.screenMessageId,
+      );
       return;
     }
 
-    await ctx.reply("Анализирую страницу и формирую правило отслеживания…");
+    await renderScreen(
+      ctx,
+      userId,
+      screenMessages,
+      "Проверяю доступность страницы…",
+      undefined,
+      pending.screenMessageId,
+    );
+
+    let snapshot: PageSnapshot;
     try {
-      // Сначала проверяем URL, чтобы не расходовать AI-запрос на недоступную страницу.
-      const snapshot = await pageFetcher.fetch(pending.url);
+      // URL проверяется до LLM-вызова, чтобы не расходовать токены на недоступную страницу.
+      snapshot = await pageFetcher.fetch(pending.url);
+    } catch (error) {
+      pendingWatches.set(userId, pending);
+      await renderScreen(
+        ctx,
+        userId,
+        screenMessages,
+        formatPageLoadError(error),
+        instructionNavigationKeyboard(),
+        pending.screenMessageId,
+      );
+      return;
+    }
+
+    await renderScreen(
+      ctx,
+      userId,
+      screenMessages,
+      "Страница доступна. Формирую правило отслеживания…",
+      undefined,
+      pending.screenMessageId,
+    );
+
+    try {
       const policy = await semanticEvaluator.createPolicy(instruction);
-      pendingWatches.set(userId, {
+      const next: WaitingConfirmation = {
         step: "WAITING_CONFIRMATION",
         url: pending.url,
         instruction,
         policy,
         snapshot,
-      });
+        screenMessageId: pending.screenMessageId,
+      };
+      pendingWatches.set(userId, next);
 
-      await ctx.reply(formatPolicyPreview(snapshot, policy), {
-        reply_markup: policyConfirmationKeyboard(),
-        link_preview_options: { is_disabled: true },
-      });
+      await renderScreen(
+        ctx,
+        userId,
+        screenMessages,
+        formatPolicyPreview(snapshot, policy),
+        policyConfirmationKeyboard(),
+        next.screenMessageId,
+      );
     } catch (error) {
       pendingWatches.set(userId, pending);
-      await ctx.reply(
-        `Не удалось подготовить правило: ${toSafeErrorMessage(error)}\n\n` +
-          "Попробуйте отправить описание ещё раз или отмените настройку.",
-        { reply_markup: instructionNavigationKeyboard() },
+      await renderScreen(
+        ctx,
+        userId,
+        screenMessages,
+        formatPolicyError(error),
+        instructionNavigationKeyboard(),
+        pending.screenMessageId,
       );
     }
   });
@@ -418,78 +611,138 @@ async function startAddPage(
   ctx: Context,
   userId: string,
   pendingWatches: Map<string, PendingWatch>,
+  screenMessages: Map<string, number>,
   store: JsonStore,
   appConfig: AppConfig,
 ): Promise<void> {
   const trackedCount = await store.countTrackedWatches(userId);
   if (trackedCount >= appConfig.maxActiveWatchesPerUser) {
-    await ctx.reply(
+    await renderScreen(
+      ctx,
+      userId,
+      screenMessages,
       `Достигнут лимит отслеживаемых страниц: ${appConfig.maxActiveWatchesPerUser}.`,
-      { reply_markup: mainMenuKeyboard() },
+      mainNavigationKeyboard(),
     );
     return;
   }
 
-  pendingWatches.set(userId, { step: "WAITING_URL" });
-  await askForUrl(ctx);
+  const screenMessageId = await renderScreen(
+    ctx,
+    userId,
+    screenMessages,
+    urlPromptText(),
+    flowCancelKeyboard(),
+  );
+  pendingWatches.set(userId, { step: "WAITING_URL", screenMessageId });
 }
 
-async function askForUrl(ctx: Context): Promise<void> {
-  await ctx.reply(
-    "Отправьте ссылку на публичную страницу. Поддерживаются HTTP/HTTPS-страницы без авторизации.",
-    { reply_markup: flowCancelKeyboard() },
+async function askForUrl(
+  ctx: Context,
+  userId: string,
+  screenMessages: Map<string, number>,
+  screenMessageId: number,
+): Promise<void> {
+  await renderScreen(
+    ctx,
+    userId,
+    screenMessages,
+    urlPromptText(),
+    flowCancelKeyboard(),
+    screenMessageId,
   );
 }
 
-async function askForInstruction(ctx: Context): Promise<void> {
-  await ctx.reply(
-    [
-      "На что нужно обращать внимание?",
-      "",
-      "Опишите, что должно появиться или произойти на странице, а что можно не учитывать.",
-      "",
-      "Например: «Сообщи, когда откроется регистрация. Обновления программы и состава спикеров не учитывать».",
-    ].join("\n"),
-    { reply_markup: instructionNavigationKeyboard() },
+async function askForInstruction(
+  ctx: Context,
+  userId: string,
+  screenMessages: Map<string, number>,
+  screenMessageId: number,
+): Promise<void> {
+  await renderScreen(
+    ctx,
+    userId,
+    screenMessages,
+    instructionPromptText(),
+    instructionNavigationKeyboard(),
+    screenMessageId,
   );
 }
 
-async function showTrackedPages(ctx: Context, userId: string, store: JsonStore): Promise<void> {
+async function showTrackedPages(
+  ctx: Context,
+  userId: string,
+  store: JsonStore,
+  screenMessages: Map<string, number>,
+): Promise<void> {
   const watches = await store.listTrackedWatches(userId);
   if (watches.length === 0) {
-    await ctx.reply("Сейчас ничего не отслеживается.", {
-      reply_markup: new InlineKeyboard().text("Добавить страницу", "nav:add"),
-    });
+    await renderScreen(
+      ctx,
+      userId,
+      screenMessages,
+      "Сейчас ничего не отслеживается.",
+      new InlineKeyboard().text("Добавить страницу", "nav:add"),
+    );
     return;
   }
 
-  await ctx.reply(`Отслеживаемые страницы: ${watches.length}`, {
-    reply_markup: mainMenuKeyboard(),
+  const lines = ["Отслеживаемые страницы", ""];
+  watches.forEach((watch, index) => {
+    const status = watch.status === "ACTIVE" ? "отслеживается" : "приостановлено";
+    lines.push(`${index + 1}. ${pageTitle(watch)}`, `   ${status}`, "");
   });
-  for (const watch of watches) {
-    await sendPageCard(ctx, watch);
-  }
+
+  await renderScreen(
+    ctx,
+    userId,
+    screenMessages,
+    lines.join("\n").trim(),
+    trackedPagesKeyboard(watches),
+  );
 }
 
-async function sendPageCard(ctx: Context, watch: Watch): Promise<void> {
-  await ctx.reply(formatPageCard(watch), {
-    reply_markup: pageCardKeyboard(watch),
-    link_preview_options: { is_disabled: true },
-  });
+async function renderPageCard(
+  ctx: Context,
+  userId: string,
+  watch: Watch,
+  screenMessages: Map<string, number>,
+  preferredMessageId?: number,
+): Promise<void> {
+  await renderScreen(
+    ctx,
+    userId,
+    screenMessages,
+    formatPageCard(watch),
+    pageCardKeyboard(watch),
+    preferredMessageId,
+  );
 }
 
-async function checkPageAndReply(
+async function checkPageAndRender(
   ctx: Context,
   userId: string,
   watch: Watch,
   store: JsonStore,
   checkService: WatchCheckService,
+  screenMessages: Map<string, number>,
 ): Promise<void> {
+  const screenMessageId = await renderScreen(
+    ctx,
+    userId,
+    screenMessages,
+    `Проверяю страницу «${pageTitle(watch)}»…`,
+  );
+
   if (watch.pendingNotification) {
-    await ctx.reply(formatImportantChange(watch, watch.pendingNotification), {
-      reply_markup: importantNotificationKeyboard(watch),
-      link_preview_options: { is_disabled: true },
-    });
+    await renderScreen(
+      ctx,
+      userId,
+      screenMessages,
+      [formatImportantChange(watch, watch.pendingNotification), "", formatPageCard(watch)].join("\n"),
+      pageCardKeyboard(watch),
+      screenMessageId,
+    );
     await store.markNotificationDelivered({
       telegramUserId: userId,
       watchId: watch.id,
@@ -498,17 +751,17 @@ async function checkPageAndReply(
     return;
   }
 
-  await ctx.reply(`Проверяю страницу «${pageTitle(watch)}»…`);
   try {
     const result = await checkService.check(watch);
-    const options =
-      result.kind === "MATCH"
-        ? {
-            reply_markup: importantNotificationKeyboard(result.watch),
-            link_preview_options: { is_disabled: true },
-          }
-        : { link_preview_options: { is_disabled: true } };
-    await ctx.reply(formatCheckResult(result), options);
+    const updatedWatch = (await store.findTrackedWatch(userId, watch.id)) ?? result.watch;
+    await renderScreen(
+      ctx,
+      userId,
+      screenMessages,
+      [formatCheckResult(result), "", "────────", "", formatPageCard(updatedWatch)].join("\n"),
+      pageCardKeyboard(updatedWatch),
+      screenMessageId,
+    );
 
     if (result.kind === "MATCH" && !result.duplicate) {
       await store.markNotificationDelivered({
@@ -518,11 +771,19 @@ async function checkPageAndReply(
       });
     }
   } catch (error) {
-    if (error instanceof WatchCheckInProgressError) {
-      await ctx.reply("Эта страница уже проверяется в фоне. Попробуйте ещё раз через несколько секунд.");
-      return;
-    }
-    await ctx.reply(`Не удалось выполнить проверку: ${toSafeErrorMessage(error)}`);
+    const message =
+      error instanceof WatchCheckInProgressError
+        ? "Эта страница уже проверяется в фоне. Попробуйте ещё раз через несколько секунд."
+        : `Не удалось выполнить проверку: ${toSafeErrorMessage(error)}`;
+    const updatedWatch = (await store.findTrackedWatch(userId, watch.id)) ?? watch;
+    await renderScreen(
+      ctx,
+      userId,
+      screenMessages,
+      [message, "", formatPageCard(updatedWatch)].join("\n"),
+      pageCardKeyboard(updatedWatch),
+      screenMessageId,
+    );
   }
 }
 
@@ -543,10 +804,9 @@ async function resolveWatchForCommandCheck(
     return "Сейчас нет активных страниц для проверки.";
   }
   if (watches.length > 1) {
-    return "Откройте «Отслеживаемые страницы» и нажмите «Проверить сейчас» на нужной карточке.";
+    return "Откройте «Отслеживаемые страницы» и выберите нужную страницу.";
   }
-  const onlyWatch = watches[0];
-  return onlyWatch ?? "Сейчас нет активных страниц для проверки.";
+  return watches[0] ?? "Сейчас нет активных страниц для проверки.";
 }
 
 function createWatchFromDraft(
@@ -622,7 +882,7 @@ function formatCheckResult(result: WatchCheckResult): string {
       return "Страница не обновилась. AI-анализ не запускался.";
     case "NO_MATCH": {
       const header = result.evaluation.conditionMatched
-        ? "Сервис не смог достаточно уверенно подтвердить, что нужная информация уже появилась."
+        ? "Сервис не смог уверенно подтвердить, что нужная информация уже появилась."
         : "Страница обновилась, но нужная информация не появилась.";
       return [header, "", result.evaluation.summary].join("\n");
     }
@@ -639,6 +899,13 @@ function mainMenuKeyboard(): Keyboard {
     .text(MENU_HELP)
     .resized()
     .persistent();
+}
+
+function mainNavigationKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("Добавить страницу", "nav:add")
+    .row()
+    .text("Отслеживаемые страницы", "nav:list");
 }
 
 function flowCancelKeyboard(): InlineKeyboard {
@@ -659,6 +926,15 @@ function policyConfirmationKeyboard(): InlineKeyboard {
     .text("Отмена", FLOW_CANCEL);
 }
 
+function trackedPagesKeyboard(watches: Watch[]): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  for (const watch of watches) {
+    const status = watch.status === "ACTIVE" ? "Активна" : "Пауза";
+    keyboard.text(`${status}: ${truncate(pageTitle(watch), 32)}`, `page:view:${watch.id}`).row();
+  }
+  return keyboard.text("Добавить страницу", "nav:add");
+}
+
 function pageCardKeyboard(watch: Watch): InlineKeyboard {
   const keyboard = new InlineKeyboard();
   if (watch.status === "ACTIVE") {
@@ -673,7 +949,10 @@ function pageCardKeyboard(watch: Watch): InlineKeyboard {
       .text("Удалить", `page:delete:${watch.id}`)
       .row();
   }
-  return keyboard.url("Открыть страницу", watch.url);
+  return keyboard
+    .url("Открыть страницу", watch.url)
+    .row()
+    .text("К списку", "nav:list");
 }
 
 function deleteConfirmationKeyboard(watchId: string): InlineKeyboard {
@@ -682,26 +961,70 @@ function deleteConfirmationKeyboard(watchId: string): InlineKeyboard {
     .text("Отмена", `page:delete-cancel:${watchId}`);
 }
 
-function parsePageAction(
-  data: string,
-): { action: "check" | "pause" | "resume" | "delete" | "delete-confirm" | "delete-cancel"; watchId: string } | null {
-  const match = /^page:(check|pause|resume|delete|delete-confirm|delete-cancel):([a-z0-9]+)$/.exec(data);
+function parsePageAction(data: string): { action: PageAction; watchId: string } | null {
+  const match = /^page:(view|check|pause|resume|delete|delete-confirm|delete-cancel):([a-z0-9]+)$/.exec(data);
   if (!match) return null;
   const action = match[1];
   const watchId = match[2];
   if (!action || !watchId) return null;
-  return {
-    action: action as "check" | "pause" | "resume" | "delete" | "delete-confirm" | "delete-cancel",
-    watchId,
-  };
+  return { action: action as PageAction, watchId };
 }
 
-async function removeInlineKeyboard(ctx: Context): Promise<void> {
-  try {
-    await ctx.editMessageReplyMarkup({ reply_markup: new InlineKeyboard() });
-  } catch {
-    // Сообщение могло быть удалено или уже отредактировано. Основной сценарий продолжается.
+async function renderScreen(
+  ctx: Context,
+  userId: string,
+  screenMessages: Map<string, number>,
+  text: string,
+  keyboard?: InlineKeyboard,
+  preferredMessageId?: number,
+): Promise<number> {
+  const chatId = ctx.chat?.id;
+  if (chatId === undefined) {
+    throw new Error("Telegram chat ID is unavailable.");
   }
+
+  const callbackMessageId = getCallbackMessageId(ctx);
+  const messageId = preferredMessageId ?? callbackMessageId ?? screenMessages.get(userId);
+  const options = {
+    ...(keyboard ? { reply_markup: keyboard } : {}),
+    link_preview_options: { is_disabled: true },
+  };
+
+  if (messageId !== undefined) {
+    try {
+      await ctx.api.editMessageText(chatId, messageId, text, options);
+      screenMessages.set(userId, messageId);
+      return messageId;
+    } catch (error) {
+      if (isMessageNotModifiedError(error)) {
+        screenMessages.set(userId, messageId);
+        return messageId;
+      }
+      // Старое сообщение могло быть удалено или стать недоступным для редактирования.
+    }
+  }
+
+  const message = await ctx.reply(text, options);
+  screenMessages.set(userId, message.message_id);
+  return message.message_id;
+}
+
+async function tryDeleteIncomingMessage(ctx: Context): Promise<void> {
+  if (!ctx.message) return;
+  try {
+    await ctx.deleteMessage();
+  } catch {
+    // Удаление — только UX-оптимизация. Ошибка не должна ломать основной сценарий.
+  }
+}
+
+function getCallbackMessageId(ctx: Context): number | null {
+  const message = ctx.callbackQuery?.message;
+  return message && "message_id" in message ? message.message_id : null;
+}
+
+function isMessageNotModifiedError(error: unknown): boolean {
+  return error instanceof Error && error.message.toLowerCase().includes("message is not modified");
 }
 
 async function requireAccess(ctx: Context, accessService: AccessService): Promise<string | null> {
@@ -741,8 +1064,49 @@ function formatListBlock(title: string, values: string[]): string[] {
   return ["", title, ...values.map((value) => `• ${value}`)];
 }
 
+function formatPolicyError(error: unknown): string {
+  if (error instanceof PolicyNotUnderstoodError) {
+    return [
+      "Не удалось понять, что именно нужно отслеживать.",
+      "",
+      "Опишите задачу немного подробнее.",
+      "",
+      "Например: «Сообщи, когда откроется регистрация. Обновления программы и состава спикеров не учитывать».",
+    ].join("\n");
+  }
+  if (error instanceof PolicyResponseError) {
+    return [
+      "Не удалось сформировать понятное правило.",
+      "",
+      "Попробуйте переформулировать, что именно должно появиться или произойти на странице.",
+    ].join("\n");
+  }
+  return [
+    "Сервис временно не смог сформировать правило.",
+    "",
+    "Попробуйте ещё раз чуть позже или измените описание.",
+  ].join("\n");
+}
+
+function formatPageLoadError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : "";
+  if (raw.includes("HTTP 403")) {
+    return "Сайт запретил автоматическую загрузку страницы (HTTP 403). Попробуйте другую публичную страницу.";
+  }
+  if (raw.includes("timed out")) {
+    return "Страница не ответила вовремя. Попробуйте ещё раз или отправьте другую ссылку.";
+  }
+  if (raw.includes("private or non-routable")) {
+    return "Этот адрес ведёт в локальную или закрытую сеть и не может быть проверен.";
+  }
+  if (raw.includes("Unsupported content type")) {
+    return "По ссылке нет поддерживаемой текстовой HTML-страницы.";
+  }
+  return "Не удалось загрузить страницу. Проверьте ссылку и попробуйте ещё раз.";
+}
+
 function toSafeErrorMessage(error: unknown): string {
-  return error instanceof Error ? truncate(error.message, 300) : "unknown error";
+  return error instanceof Error ? truncate(error.message, 300) : "неизвестная ошибка";
 }
 
 function unauthorizedText(userId: string, activationEnabled: boolean): string {
@@ -771,5 +1135,19 @@ function helpText(): string {
     "",
     "В карточке страницы можно запустить проверку вручную, приостановить отслеживание или удалить страницу.",
     "AI вызывается только при настройке правила и после реального обновления текста страницы.",
+  ].join("\n");
+}
+
+function urlPromptText(): string {
+  return "Отправьте ссылку на публичную страницу. Поддерживаются HTTP/HTTPS-страницы без авторизации.";
+}
+
+function instructionPromptText(): string {
+  return [
+    "На что нужно обращать внимание?",
+    "",
+    "Опишите, что должно появиться или произойти на странице, а что можно не учитывать.",
+    "",
+    "Например: «Сообщи, когда откроется регистрация. Обновления программы и состава спикеров не учитывать».",
   ].join("\n");
 }

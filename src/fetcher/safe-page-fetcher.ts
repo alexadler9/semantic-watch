@@ -1,4 +1,4 @@
-import { lookup } from "node:dns";
+import { lookup, type LookupAddress, type LookupAllOptions } from "node:dns";
 import { request as httpRequest, type RequestOptions } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
@@ -166,18 +166,57 @@ function requestUrl(options: RequestUrlOptions): Promise<RawResponse> {
 
 function createSafeLookup(allowLocalDemo: boolean): NonNullable<RequestOptions["lookup"]> {
   return (hostname, options, callback) => {
-    lookup(hostname, { ...options, all: false }, (error, address, family) => {
+    const requestedAll = options.all === true;
+    const lookupOptions: LookupAllOptions = {
+      all: true,
+      verbatim: true,
+    };
+    if (options.family !== undefined) {
+      lookupOptions.family = options.family;
+    }
+    if (options.hints !== undefined) {
+      lookupOptions.hints = options.hints;
+    }
+
+    lookup(hostname, lookupOptions, (error, addresses) => {
       if (error) {
-        callback(error, address, family);
+        callback(error, requestedAll ? [] : "", 0);
         return;
       }
-      if (!allowLocalDemo && isForbiddenAddress(address)) {
-        callback(new Error("The URL resolves to a private or non-routable network address."), address, family);
+      if (addresses.length === 0) {
+        callback(new Error("The hostname did not resolve to an IP address."), requestedAll ? [] : "", 0);
         return;
       }
-      callback(null, address, family);
+
+      if (!allowLocalDemo && addresses.some((entry) => isForbiddenAddress(entry.address))) {
+        callback(
+          new Error("The URL resolves to a private or non-routable network address."),
+          requestedAll ? [] : "",
+          0,
+        );
+        return;
+      }
+
+      if (requestedAll) {
+        callback(null, addresses);
+        return;
+      }
+
+      const selected = selectAddress(addresses, options.family);
+      callback(null, selected.address, selected.family);
     });
   };
+}
+
+function selectAddress(
+  addresses: LookupAddress[],
+  requestedFamily: number | "IPv4" | "IPv6" | undefined,
+): LookupAddress {
+  const normalizedFamily = requestedFamily === "IPv4" ? 4 : requestedFamily === "IPv6" ? 6 : requestedFamily;
+  if (normalizedFamily === 4 || normalizedFamily === 6) {
+    return addresses.find((entry) => entry.family === normalizedFamily) ?? addresses[0]!;
+  }
+  return addresses[0]!;
 }
 
 function normalizeUrl(raw: string): string {
@@ -235,7 +274,14 @@ function isForbiddenIpv6(address: string): boolean {
   if (normalized === "::" || normalized === "::1") {
     return true;
   }
-  if (normalized.startsWith("fc") || normalized.startsWith("fd") || normalized.startsWith("fe8") || normalized.startsWith("fe9") || normalized.startsWith("fea") || normalized.startsWith("feb")) {
+  if (
+    normalized.startsWith("fc") ||
+    normalized.startsWith("fd") ||
+    normalized.startsWith("fe8") ||
+    normalized.startsWith("fe9") ||
+    normalized.startsWith("fea") ||
+    normalized.startsWith("feb")
+  ) {
     return true;
   }
   if (normalized.startsWith("::ffff:")) {

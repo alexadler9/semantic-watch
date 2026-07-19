@@ -4,9 +4,18 @@ import { JsonStore } from "../storage/json-store.js";
 import { DeepSeekClient } from "./deepseek-client.js";
 
 const watchPolicySchema = z.object({
-  targetEvent: z.string().min(3).max(500),
-  requiredSignals: z.array(z.string().min(2).max(300)).min(1).max(8),
-  ignoredChanges: z.array(z.string().min(2).max(300)).max(8),
+  targetEvent: z.string().trim().min(3).max(500),
+  requiredSignals: z.array(z.string().trim().min(2).max(300)).min(1).max(8),
+  ignoredChanges: z.array(z.string().trim().min(2).max(300)).max(8),
+});
+
+// Сначала разбираем ответ мягко, чтобы пустые признаки трактовать как просьбу уточнить задачу,
+// а не показывать пользователю внутреннюю ошибку валидации.
+const policyEnvelopeSchema = z.object({
+  understood: z.boolean().optional(),
+  targetEvent: z.string().optional(),
+  requiredSignals: z.array(z.string()).optional(),
+  ignoredChanges: z.array(z.string()).optional(),
 });
 
 const evaluationSchema = z.object({
@@ -19,6 +28,20 @@ const evaluationSchema = z.object({
 
 export interface SemanticEvaluatorOptions {
   maxLlmCallsPerDay: number;
+}
+
+export class PolicyNotUnderstoodError extends Error {
+  constructor() {
+    super("Не удалось понять, что именно нужно отслеживать.");
+    this.name = "PolicyNotUnderstoodError";
+  }
+}
+
+export class PolicyResponseError extends Error {
+  constructor(cause?: unknown) {
+    super("AI вернул некорректное правило отслеживания.", { cause });
+    this.name = "PolicyResponseError";
+  }
 }
 
 export class SemanticEvaluator {
@@ -34,7 +57,30 @@ export class SemanticEvaluator {
       POLICY_SYSTEM_PROMPT,
       `Пользовательская инструкция:\n${instruction}`,
     );
-    return watchPolicySchema.parse(payload);
+
+    const envelope = policyEnvelopeSchema.safeParse(payload);
+    if (!envelope.success) {
+      throw new PolicyResponseError(envelope.error);
+    }
+
+    const value = envelope.data;
+    const targetEvent = value.targetEvent?.trim() ?? "";
+    const requiredSignals = (value.requiredSignals ?? []).map((item) => item.trim()).filter(Boolean);
+    const ignoredChanges = (value.ignoredChanges ?? []).map((item) => item.trim()).filter(Boolean);
+
+    if (value.understood === false || targetEvent.length < 3 || requiredSignals.length === 0) {
+      throw new PolicyNotUnderstoodError();
+    }
+
+    const parsed = watchPolicySchema.safeParse({
+      targetEvent,
+      requiredSignals,
+      ignoredChanges,
+    });
+    if (!parsed.success) {
+      throw new PolicyResponseError(parsed.error);
+    }
+    return parsed.data;
   }
 
   async evaluateChange(input: {
@@ -66,15 +112,30 @@ const POLICY_SYSTEM_PROMPT = `
 Ты формируешь правило семантического отслеживания веб-страницы.
 Верни только один JSON-объект без markdown и пояснений.
 
-Нужно понять:
-- какое изменение пользователь считает целевым событием;
-- какие признаки подтверждают, что событие действительно произошло;
-- какие изменения пользователь просит игнорировать.
-
-Не добавляй конкретные факты, которых нет в инструкции. Формулируй признаки обобщённо.
-
-Пример JSON:
+Сначала оцени, удалось ли понять конкретную цель пользователя.
+Если текст бессмысленный, состоит из случайных слов или не содержит того, что нужно искать на странице, верни:
 {
+  "understood": false
+}
+
+Если цель понятна, верни:
+{
+  "understood": true,
+  "targetEvent": "краткое описание того, что нужно обнаружить",
+  "requiredSignals": ["минимум один проверяемый признак"],
+  "ignoredChanges": ["то, что пользователь просит не учитывать"]
+}
+
+Правила:
+- requiredSignals всегда содержит хотя бы один содержательный признак;
+- не выдумывай конкретные факты, которых нет в инструкции;
+- формулируй признаки обобщённо;
+- если пользователь не назвал игнорируемые обновления, верни пустой ignoredChanges;
+- не пытайся придать смысл случайному или слишком общему набору слов.
+
+Пример:
+{
+  "understood": true,
   "targetEvent": "Открылась регистрация для участников",
   "requiredSignals": [
     "появилась возможность зарегистрироваться",
