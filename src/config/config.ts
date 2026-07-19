@@ -11,7 +11,6 @@ const booleanDefaultTrueFromEnv = z
   .optional()
   .transform((value) => value === undefined || value.trim().toLowerCase() === "true");
 
-
 const envSchema = z.object({
   TELEGRAM_BOT_TOKEN: z.string().min(1),
   TELEGRAM_OWNER_IDS: z.string().optional().default(""),
@@ -24,6 +23,7 @@ const envSchema = z.object({
   MAX_DIFF_CHARS: z.coerce.number().int().min(1000).max(50_000).default(12_000),
   MAX_LLM_CALLS_PER_DAY: z.coerce.number().int().min(1).max(1000).default(50),
   MATCH_CONFIDENCE_THRESHOLD: z.coerce.number().min(0.5).max(1).default(0.8),
+  RESULT_SCREENSHOT_ENABLED: booleanDefaultTrueFromEnv,
   DEEPSEEK_API_KEY: z.string().min(1),
   DEEPSEEK_BASE_URL: z.string().url().optional().default("https://api.deepseek.com"),
   DEEPSEEK_MODEL: z.string().min(1).optional().default("deepseek-v4-flash"),
@@ -70,6 +70,7 @@ export interface AppConfig {
   maxDiffChars: number;
   maxLlmCallsPerDay: number;
   matchConfidenceThreshold: number;
+  resultScreenshotEnabled: boolean;
   deepSeekApiKey: string;
   deepSeekBaseUrl: string;
   deepSeekModel: string;
@@ -97,6 +98,7 @@ export const config: AppConfig = {
   maxDiffChars: parsed.data.MAX_DIFF_CHARS,
   maxLlmCallsPerDay: parsed.data.MAX_LLM_CALLS_PER_DAY,
   matchConfidenceThreshold: parsed.data.MATCH_CONFIDENCE_THRESHOLD,
+  resultScreenshotEnabled: parsed.data.RESULT_SCREENSHOT_ENABLED,
   deepSeekApiKey: parsed.data.DEEPSEEK_API_KEY,
   deepSeekBaseUrl: parsed.data.DEEPSEEK_BASE_URL.replace(/\/+$/, ""),
   deepSeekModel: parsed.data.DEEPSEEK_MODEL,

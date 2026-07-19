@@ -24,6 +24,7 @@
     "cheerio": "1.2.0",
     "dotenv": "17.4.2",
     "grammy": "1.44.0",
+    "playwright": "^1.55.0",
     "zod": "4.4.3"
   },
   "devDependencies": {

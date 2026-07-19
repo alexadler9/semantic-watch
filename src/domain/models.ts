@@ -10,6 +10,8 @@ export interface WatchPolicy {
   targetEvent: string;
   requiredSignals: string[];
   ignoredChanges: string[];
+  requestedOutput: string | null;
+  notificationInstruction: string | null;
 }
 
 export interface PolicyRevision {
@@ -24,11 +26,46 @@ export interface SemanticState {
   updatedAt: string;
 }
 
+export interface NotificationFact {
+  id: string;
+  label: string | null;
+  value: string;
+}
+
+export type NotificationMessagePart =
+  | { kind: "TEXT"; text: string }
+  | { kind: "FACT"; factId: string };
+
+export type NotificationMessageBlock =
+  | {
+      type: "PARAGRAPH";
+      parts: NotificationMessagePart[];
+    }
+  | {
+      type: "LIST";
+      title: string | null;
+      factIds: string[];
+    }
+  | {
+      type: "KEY_VALUE";
+      title: string | null;
+      rows: Array<{ label: string; factId: string }>;
+    }
+  | {
+      type: "QUOTE";
+      factId: string;
+    };
+
 export interface SemanticEvaluation {
   meaningfulChange: boolean;
   conditionMatched: boolean;
   confidence: number;
   summary: string;
+  notificationFacts: NotificationFact[];
+  notificationBlocks: NotificationMessageBlock[];
+  // Legacy fields are kept for feedback history and old persisted notifications.
+  resultTitle: string | null;
+  resultItems: string[];
   evidence: string[];
   currentState: string;
 }
@@ -37,7 +74,12 @@ export interface PendingNotification {
   id: string;
   fingerprint: string;
   summary: string;
+  notificationFacts: NotificationFact[];
+  notificationBlocks: NotificationMessageBlock[];
+  resultTitle: string | null;
+  resultItems: string[];
   evidence: string[];
+  visualFilePath: string | null;
   createdAt: string;
   nextAttemptAt: string;
   attempts: number;
@@ -49,6 +91,10 @@ export interface DeliveredResult {
   id: string;
   fingerprint: string;
   summary: string;
+  notificationFacts: NotificationFact[];
+  notificationBlocks: NotificationMessageBlock[];
+  resultTitle: string | null;
+  resultItems: string[];
   evidence: string[];
   createdAt: string;
   deliveredAt: string;
@@ -98,4 +144,13 @@ export interface PageSnapshot {
   text: string;
   hash: string;
   fetchedAt: string;
+}
+
+export interface PageVisualObservation {
+  image: Buffer;
+}
+
+export interface PageObservation {
+  snapshot: PageSnapshot;
+  visual: PageVisualObservation | null;
 }

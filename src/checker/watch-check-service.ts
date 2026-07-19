@@ -1,7 +1,22 @@
 import { SemanticEvaluator } from "../ai/semantic-evaluator.js";
-import type { PendingNotification, SemanticEvaluation, Watch } from "../domain/models.js";
-import { SafePageFetcher } from "../fetcher/safe-page-fetcher.js";
+import type {
+  PendingNotification,
+  SemanticEvaluation,
+  Watch,
+} from "../domain/models.js";
+import {
+  groundEvidence,
+  groundNotificationFacts,
+  isVolatileEvidence,
+  normalizeEvidenceText,
+} from "../evidence/evidence-grounding.js";
+import type { PageFetcher } from "../fetcher/page-fetcher.js";
+import {
+  notificationFactValues,
+  sanitizeNotificationBlocks,
+} from "../notifications/notification-content.js";
 import { JsonStore } from "../storage/json-store.js";
+import type { VisualEvidenceService } from "../visual/visual-evidence-service.js";
 import { sha256 } from "../utils/hash.js";
 import { buildTextDiff } from "../utils/text-diff.js";
 import { addMinutesIso } from "../utils/time.js";
@@ -35,8 +50,9 @@ export class WatchCheckService {
 
   constructor(
     private readonly store: JsonStore,
-    private readonly pageFetcher: SafePageFetcher,
+    private readonly pageFetcher: PageFetcher,
     private readonly semanticEvaluator: SemanticEvaluator,
+    private readonly visualEvidence: VisualEvidenceService,
     private readonly options: WatchCheckServiceOptions,
   ) {}
 
@@ -54,7 +70,8 @@ export class WatchCheckService {
   }
 
   private async checkUnlocked(watch: Watch): Promise<WatchCheckResult> {
-    const snapshot = await this.pageFetcher.fetch(watch.url);
+    const observation = await this.pageFetcher.fetch(watch.url, { captureVisual: true });
+    const snapshot = observation.snapshot;
     const nextCheckAt = addMinutesIso(snapshot.fetchedAt, this.options.checkIntervalMinutes);
 
     if (snapshot.hash === watch.lastContentHash) {
@@ -78,7 +95,7 @@ export class WatchCheckService {
     }
 
     const diff = buildTextDiff(watch.lastSnapshot, snapshot.text, this.options.maxDiffChars);
-    const evaluation = await this.semanticEvaluator.evaluateChange({
+    let evaluation = await this.semanticEvaluator.evaluateChange({
       instruction: watch.instruction,
       policy,
       previousState: watch.semanticState?.summary ?? null,
@@ -89,21 +106,105 @@ export class WatchCheckService {
       evaluation.conditionMatched &&
       evaluation.confidence >= this.options.matchConfidenceThreshold;
 
+    if (matched) {
+      const outputWasRequested =
+        policy.requestedOutput !== null || instructionRequestsOutput(watch.instruction);
+      const rawFacts = outputWasRequested ? evaluation.notificationFacts : [];
+      const groundedFacts = groundNotificationFacts({
+        aiFacts: rawFacts,
+        currentText: snapshot.text,
+        diff,
+        maxItems: 16,
+      });
+      const groundedBlocks = sanitizeNotificationBlocks({
+        blocks: outputWasRequested ? evaluation.notificationBlocks : [],
+        facts: groundedFacts,
+        instruction: watch.instruction,
+        policy,
+      });
+      const groundedResultItems = notificationFactValues(groundedFacts);
+      const groundedEvidence = groundEvidence({
+        aiEvidence: [...evaluation.evidence, ...groundedResultItems.slice(0, 3)],
+        currentText: snapshot.text,
+        diff,
+      });
+
+      if (groundedEvidence.length === 0) {
+        console.warn("AI match has no exact evidence anchor; notification will be sent without quotes.", {
+          watchId: watch.id,
+        });
+      }
+      if (outputWasRequested && groundedFacts.length === 0) {
+        console.warn("The user requested result data, but no notification fact could be grounded.", {
+          watchId: watch.id,
+        });
+      }
+
+      evaluation = {
+        ...evaluation,
+        notificationFacts: groundedFacts,
+        notificationBlocks: groundedBlocks,
+        resultTitle:
+          groundedResultItems.length > 0
+            ? normalizeResultTitle(
+                evaluation.resultTitle ??
+                  policy.requestedOutput ??
+                  inferResultTitle(watch.instruction),
+              )
+            : null,
+        resultItems: groundedResultItems,
+        evidence: groundedEvidence,
+      };
+    } else {
+      evaluation = {
+        ...evaluation,
+        notificationFacts: [],
+        notificationBlocks: [],
+        resultTitle: null,
+        resultItems: [],
+        evidence: [],
+      };
+    }
+
     let notificationFingerprint: string | undefined;
     let duplicate = false;
     let pendingNotification: PendingNotification | undefined;
 
     if (matched) {
-      validateEvidence(evaluation.evidence, snapshot.text);
-      notificationFingerprint = buildNotificationFingerprint(policy.targetEvent, evaluation.evidence);
+      notificationFingerprint = buildNotificationFingerprint(
+        policy.targetEvent,
+        evaluation.resultItems,
+        evaluation.evidence,
+        evaluation.summary,
+      );
       duplicate = notificationFingerprint === watch.lastNotificationFingerprint;
 
       if (!duplicate) {
+        let visualFilePath: string | null = null;
+        if (observation.visual) {
+          try {
+            visualFilePath = await this.visualEvidence.prepareAndStore({
+              observation: observation.visual,
+              imageId: `${watch.id}-${notificationFingerprint.slice(0, 24)}`,
+            });
+          } catch (error) {
+            console.warn("Could not prepare the captured page image; notification stays text-only.", {
+              watchId: watch.id,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+
         pendingNotification = {
           id: notificationFingerprint.slice(0, 12),
           fingerprint: notificationFingerprint,
           summary: evaluation.summary,
+          notificationFacts: evaluation.notificationFacts,
+          notificationBlocks: evaluation.notificationBlocks,
+          resultTitle: evaluation.resultTitle,
+          resultItems: evaluation.resultItems,
           evidence: evaluation.evidence,
+          visualFilePath,
           createdAt: snapshot.fetchedAt,
           nextAttemptAt: snapshot.fetchedAt,
           attempts: 0,
@@ -123,6 +224,7 @@ export class WatchCheckService {
       ...(pendingNotification ? { pendingNotification } : {}),
     });
     if (!updated) {
+      await this.visualEvidence.removePrepared(pendingNotification?.visualFilePath ?? null).catch(() => undefined);
       throw new Error("Watch changed concurrently. Run the check again.");
     }
 
@@ -158,26 +260,56 @@ export class WatchCheckService {
   }
 }
 
-function validateEvidence(evidence: string[], currentText: string): void {
-  if (evidence.length === 0) {
-    throw new Error("AI reported a match without evidence. Snapshot was not updated.");
-  }
-  const normalizedPage = normalizeForEvidence(currentText);
-  const invalid = evidence.filter((quote) => !normalizedPage.includes(normalizeForEvidence(quote)));
-  if (invalid.length > 0) {
-    throw new Error("AI evidence was not found in the current page. Snapshot was not updated.");
-  }
-}
+function buildNotificationFingerprint(
+  targetEvent: string,
+  resultItems: string[],
+  evidence: string[],
+  summary: string,
+): string {
+  const stableResultItems = resultItems.filter((item) => !isVolatileEvidence(item));
+  const stableEvidence = evidence.filter((item) => !isVolatileEvidence(item));
+  const fingerprintItems =
+    stableResultItems.length > 0
+      ? stableResultItems
+      : stableEvidence.length > 0
+        ? stableEvidence
+        : resultItems.length > 0
+          ? resultItems
+          : evidence;
 
-function buildNotificationFingerprint(targetEvent: string, evidence: string[]): string {
   return sha256(
     JSON.stringify({
-      targetEvent: normalizeForEvidence(targetEvent),
-      evidence: evidence.map(normalizeForEvidence).sort(),
+      targetEvent: normalizeEvidenceText(targetEvent),
+      result:
+        fingerprintItems.length > 0
+          ? fingerprintItems.map(normalizeEvidenceText).sort()
+          : [normalizeEvidenceText(summary)],
     }),
   );
 }
 
-function normalizeForEvidence(value: string): string {
-  return value.replace(/\s+/g, " ").trim().toLocaleLowerCase("ru-RU");
+function instructionRequestsOutput(instruction: string): boolean {
+  const hasOutputVerb =
+    /(?:покаж|вывед|вывод|перечисл|пришл|присыла|напиш|пиш|добав.{0,12}(?:сообщен|уведомлен)|укаж.{0,12}(?:сообщен|уведомлен)|include|list|show|display|send)/iu.test(
+      instruction,
+    );
+  const hasOutputTarget =
+    /(?:данн|заголов|назван|список|цен|курс|процент|изменен|разниц|дат|значен|элемент|новост|item|title|name|price|rate|percent|change|date|value)/iu.test(
+      instruction,
+    );
+  return hasOutputVerb && hasOutputTarget;
+}
+
+function inferResultTitle(instruction: string): string {
+  if (/заголов|title/iu.test(instruction)) return "Новые заголовки";
+  if (/цен|price/iu.test(instruction)) return "Изменившиеся цены";
+  if (/дат|date/iu.test(instruction)) return "Новые даты";
+  if (/значен|value/iu.test(instruction)) return "Изменившиеся значения";
+  if (/назван|name/iu.test(instruction)) return "Новые названия";
+  return "Запрошенные данные";
+}
+
+function normalizeResultTitle(value: string): string {
+  const normalized = value.replace(/[:\s]+$/g, "").replace(/\s+/g, " ").trim();
+  return normalized.length <= 120 ? normalized : `${normalized.slice(0, 117).trimEnd()}…`;
 }

@@ -4,6 +4,9 @@ import type {
   AuthorizedUser,
   DeliveredResult,
   LlmUsage,
+  NotificationFact,
+  NotificationMessageBlock,
+  NotificationMessagePart,
   PageSnapshot,
   PendingNotification,
   PolicyRevision,
@@ -361,6 +364,10 @@ export class JsonStore {
         id: pending.id,
         fingerprint: pending.fingerprint,
         summary: pending.summary,
+        notificationFacts: pending.notificationFacts,
+        notificationBlocks: pending.notificationBlocks,
+        resultTitle: pending.resultTitle,
+        resultItems: pending.resultItems,
         evidence: pending.evidence,
         createdAt: pending.createdAt,
         deliveredAt: new Date().toISOString(),
@@ -540,6 +547,14 @@ function normalizePolicy(value: WatchPolicy | null | undefined): WatchPolicy | n
     ignoredChanges: Array.isArray(value.ignoredChanges)
       ? value.ignoredChanges.filter((item) => typeof item === "string")
       : [],
+    requestedOutput:
+      typeof value.requestedOutput === "string" && value.requestedOutput.trim().length > 0
+        ? value.requestedOutput.trim()
+        : null,
+    notificationInstruction:
+      typeof value.notificationInstruction === "string" && value.notificationInstruction.trim().length > 0
+        ? value.notificationInstruction.trim()
+        : null,
   };
 }
 
@@ -598,9 +613,22 @@ function normalizePendingNotification(
         : value.fingerprint.replace(/[^a-z0-9]/gi, "").slice(0, 12),
     fingerprint: value.fingerprint,
     summary: typeof value.summary === "string" ? value.summary : "На странице найдена информация.",
+    notificationFacts: normalizeNotificationFacts(value.notificationFacts),
+    notificationBlocks: normalizeNotificationBlocks(value.notificationBlocks),
+    resultTitle:
+      typeof value.resultTitle === "string" && value.resultTitle.trim().length > 0
+        ? value.resultTitle.trim()
+        : null,
+    resultItems: Array.isArray(value.resultItems)
+      ? value.resultItems.filter((item) => typeof item === "string")
+      : [],
     evidence: Array.isArray(value.evidence)
       ? value.evidence.filter((item) => typeof item === "string")
       : [],
+    visualFilePath:
+      typeof value.visualFilePath === "string" && value.visualFilePath.trim().length > 0
+        ? value.visualFilePath
+        : null,
     createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date().toISOString(),
     nextAttemptAt:
       typeof value.nextAttemptAt === "string" ? value.nextAttemptAt : new Date().toISOString(),
@@ -616,6 +644,15 @@ function normalizeDeliveredResult(value: DeliveredResult | null | undefined): De
     id: value.id,
     fingerprint: value.fingerprint,
     summary: typeof value.summary === "string" ? value.summary : "На странице найдена информация.",
+    notificationFacts: normalizeNotificationFacts(value.notificationFacts),
+    notificationBlocks: normalizeNotificationBlocks(value.notificationBlocks),
+    resultTitle:
+      typeof value.resultTitle === "string" && value.resultTitle.trim().length > 0
+        ? value.resultTitle.trim()
+        : null,
+    resultItems: Array.isArray(value.resultItems)
+      ? value.resultItems.filter((item) => typeof item === "string")
+      : [],
     evidence: Array.isArray(value.evidence)
       ? value.evidence.filter((item) => typeof item === "string")
       : [],
@@ -627,6 +664,89 @@ function normalizeDeliveredResult(value: DeliveredResult | null | undefined): De
         : "PENDING",
     feedbackReason: typeof value.feedbackReason === "string" ? value.feedbackReason : null,
   };
+}
+
+function normalizeNotificationFacts(value: NotificationFact[] | undefined): NotificationFact[] {
+  if (!Array.isArray(value)) return [];
+  const result: NotificationFact[] = [];
+  const ids = new Set<string>();
+  for (const item of value) {
+    if (!item || typeof item.id !== "string" || typeof item.value !== "string") continue;
+    const id = item.id.trim();
+    const factValue = item.value.trim();
+    if (!id || !factValue || ids.has(id)) continue;
+    ids.add(id);
+    result.push({
+      id,
+      label:
+        typeof item.label === "string" && item.label.trim().length > 0
+          ? item.label.trim()
+          : null,
+      value: factValue,
+    });
+    if (result.length >= 16) break;
+  }
+  return result;
+}
+
+function normalizeNotificationBlocks(
+  value: NotificationMessageBlock[] | undefined,
+): NotificationMessageBlock[] {
+  if (!Array.isArray(value)) return [];
+  const result: NotificationMessageBlock[] = [];
+  for (const block of value) {
+    if (!block || typeof block !== "object") continue;
+    switch (block.type) {
+      case "PARAGRAPH": {
+        if (!Array.isArray(block.parts)) break;
+        const parts: NotificationMessagePart[] = [];
+        for (const part of block.parts) {
+          if (part?.kind === "TEXT" && typeof part.text === "string") {
+            parts.push({ kind: "TEXT", text: part.text });
+          } else if (part?.kind === "FACT" && typeof part.factId === "string") {
+            parts.push({ kind: "FACT", factId: part.factId });
+          }
+        }
+        if (parts.length > 0) result.push({ type: "PARAGRAPH", parts });
+        break;
+      }
+      case "LIST": {
+        if (!Array.isArray(block.factIds)) break;
+        const factIds = block.factIds.filter((id): id is string => typeof id === "string");
+        if (factIds.length > 0) {
+          result.push({
+            type: "LIST",
+            title: typeof block.title === "string" && block.title.trim() ? block.title.trim() : null,
+            factIds,
+          });
+        }
+        break;
+      }
+      case "KEY_VALUE": {
+        if (!Array.isArray(block.rows)) break;
+        const rows = block.rows.flatMap((row) =>
+          row && typeof row.label === "string" && typeof row.factId === "string"
+            ? [{ label: row.label, factId: row.factId }]
+            : [],
+        );
+        if (rows.length > 0) {
+          result.push({
+            type: "KEY_VALUE",
+            title: typeof block.title === "string" && block.title.trim() ? block.title.trim() : null,
+            rows,
+          });
+        }
+        break;
+      }
+      case "QUOTE":
+        if (typeof block.factId === "string") {
+          result.push({ type: "QUOTE", factId: block.factId });
+        }
+        break;
+    }
+    if (result.length >= 8) break;
+  }
+  return result;
 }
 
 function normalizeUsage(value: LlmUsage | undefined): LlmUsage {

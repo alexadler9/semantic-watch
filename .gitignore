@@ -6,3 +6,4 @@ data/*.tmp
 demo-site/current.html
 npm-debug.log*
 .DS_Store
+data/visual-cache/

@@ -20,12 +20,13 @@ import type {
   Watch,
   WatchPolicy,
 } from "../domain/models.js";
-import { SafePageFetcher } from "../fetcher/safe-page-fetcher.js";
+import type { PageFetcher } from "../fetcher/page-fetcher.js";
 import {
   formatImportantChange,
-  importantNotificationKeyboard,
   resolvedNotificationKeyboard,
 } from "../notifications/telegram-messages.js";
+import { deliverImportantNotification } from "../notifications/notification-delivery.js";
+import type { VisualEvidenceService } from "../visual/visual-evidence-service.js";
 import { JsonStore } from "../storage/json-store.js";
 import { normalizeInstruction, truncate } from "../utils/text.js";
 import { addMinutesIso } from "../utils/time.js";
@@ -137,10 +138,11 @@ type FeedbackAction =
 export function createBot(
   appConfig: AppConfig,
   store: JsonStore,
-  pageFetcher: SafePageFetcher,
+  pageFetcher: PageFetcher,
   semanticEvaluator: SemanticEvaluator,
   checkService: WatchCheckService,
   screenMessages: ScreenMessageRegistry,
+  visualEvidence: VisualEvidenceService,
 ): Bot {
   const bot = new Bot(appConfig.telegramBotToken);
   const accessService = new AccessService(appConfig, store);
@@ -228,7 +230,7 @@ export function createBot(
       await renderScreen(ctx, userId, screenMessages, resolved, mainNavigationKeyboard());
       return;
     }
-    await checkPageAndRender(ctx, userId, resolved, store, checkService, screenMessages);
+    await checkPageAndRender(ctx, userId, resolved, store, checkService, screenMessages, visualEvidence);
   });
 
   bot.command("stop", async (ctx) => {
@@ -563,7 +565,7 @@ export function createBot(
           return;
         }
         await ctx.answerCallbackQuery({ text: "Проверяю" });
-        await checkPageAndRender(ctx, userId, watch, store, checkService, screenMessages);
+        await checkPageAndRender(ctx, userId, watch, store, checkService, screenMessages, visualEvidence);
         return;
       case "pause": {
         const paused = await store.pauseWatch(userId, watch.id);
@@ -784,7 +786,7 @@ export function createBot(
 
     let snapshot: PageSnapshot;
     try {
-      snapshot = await pageFetcher.fetch(pending.url);
+      snapshot = (await pageFetcher.fetch(pending.url)).snapshot;
     } catch (error) {
       pendingWatches.set(userId, pending);
       await renderScreen(
@@ -1064,6 +1066,7 @@ async function checkPageAndRender(
   store: JsonStore,
   checkService: WatchCheckService,
   screenMessages: ScreenMessageRegistry,
+  visualEvidence: VisualEvidenceService,
 ): Promise<void> {
   const screenMessageId = await renderScreen(
     ctx,
@@ -1073,7 +1076,7 @@ async function checkPageAndRender(
   );
 
   if (watch.pendingNotification) {
-    await sendPermanentNotification(ctx, userId, watch, watch.pendingNotification, screenMessages);
+    await sendPermanentNotification(ctx, userId, watch, watch.pendingNotification, screenMessages, visualEvidence);
     await store.markNotificationDelivered({
       telegramUserId: userId,
       watchId: watch.id,
@@ -1093,6 +1096,7 @@ async function checkPageAndRender(
         updatedWatch,
         updatedWatch.pendingNotification,
         screenMessages,
+        visualEvidence,
       );
       await store.markNotificationDelivered({
         telegramUserId: userId,
@@ -1133,6 +1137,7 @@ async function sendPermanentNotification(
   watch: Watch,
   notification: PendingNotification,
   screenMessages: ScreenMessageRegistry,
+  visualEvidence: VisualEvidenceService,
 ): Promise<void> {
   const chatId = ctx.chat?.id;
   if (chatId === undefined) throw new Error("Telegram chat ID is unavailable.");
@@ -1148,9 +1153,12 @@ async function sendPermanentNotification(
     }
   }
 
-  await ctx.api.sendMessage(chatId, formatImportantChange(watch, notification), {
-    link_preview_options: { is_disabled: true },
-    reply_markup: importantNotificationKeyboard(watch, notification),
+  await deliverImportantNotification({
+    api: ctx.api,
+    chatId,
+    watch,
+    notification,
+    visualEvidence,
   });
 }
 
@@ -1204,6 +1212,7 @@ async function handleNotificationAction(
       instruction: watch.instruction,
       policy: watch.policy ?? fallbackPolicy(watch),
       summary: result.summary,
+      resultItems: result.resultItems,
       evidence: result.evidence,
     });
   } catch {
@@ -1374,6 +1383,7 @@ async function prepareRefinedPolicy(
       instruction: watch.instruction,
       currentPolicy: watch.policy,
       resultSummary: result.summary,
+      resultItems: result.resultItems,
       evidence: result.evidence,
       userClarification: reason,
     });
@@ -1505,6 +1515,12 @@ function formatPolicyPreview(snapshot: PageSnapshot, policy: WatchPolicy, curren
     policy.targetEvent,
     ...formatListBlock("На что обращать внимание:", policy.requiredSignals),
     ...formatListBlock("Что не учитывать:", policy.ignoredChanges),
+    ...(policy.requestedOutput
+      ? ["", "Что включить в сообщение:", policy.requestedOutput]
+      : []),
+    ...(policy.notificationInstruction
+      ? ["", "Как оформить сообщение:", policy.notificationInstruction]
+      : []),
     "",
     "Сейчас на странице:",
     currentState,
@@ -1523,6 +1539,12 @@ function formatRefinedPolicyPreview(policy: WatchPolicy, explanation: string): s
     policy.targetEvent,
     ...formatListBlock("На что обращать внимание:", policy.requiredSignals),
     ...formatListBlock("Что не учитывать:", policy.ignoredChanges),
+    ...(policy.requestedOutput
+      ? ["", "Что включить в сообщение:", policy.requestedOutput]
+      : []),
+    ...(policy.notificationInstruction
+      ? ["", "Как оформить сообщение:", policy.notificationInstruction]
+      : []),
     "",
     "Сохранить новую версию?",
   ].join("\n");
@@ -1539,6 +1561,12 @@ function formatPageCard(watch: Watch): string {
     truncate(watch.policy?.targetEvent ?? watch.instruction, 260),
   ];
 
+  if (watch.policy?.requestedOutput) {
+    lines.push("", "В уведомлении:", truncate(watch.policy.requestedOutput, 240));
+  }
+  if (watch.policy?.notificationInstruction) {
+    lines.push("", "Формат:", truncate(watch.policy.notificationInstruction, 180));
+  }
   if (watch.semanticState) {
     lines.push("", "Сейчас на странице:", truncate(watch.semanticState.summary, 300));
   }
@@ -1919,5 +1947,7 @@ function fallbackPolicy(watch: Watch): WatchPolicy {
     targetEvent: watch.instruction,
     requiredSignals: [watch.instruction],
     ignoredChanges: [],
+    requestedOutput: null,
+    notificationInstruction: null,
   };
 }

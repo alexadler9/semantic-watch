@@ -1,11 +1,9 @@
 import type { Api } from "grammy";
 import { ScreenMessageRegistry } from "../bot/screen-message-registry.js";
 import { WatchCheckInProgressError, WatchCheckService } from "../checker/watch-check-service.js";
-import {
-  formatImportantChange,
-  importantNotificationKeyboard,
-} from "../notifications/telegram-messages.js";
+import { deliverImportantNotification } from "../notifications/notification-delivery.js";
 import { JsonStore } from "../storage/json-store.js";
+import type { VisualEvidenceService } from "../visual/visual-evidence-service.js";
 import { truncate } from "../utils/text.js";
 import { addMinutesIso } from "../utils/time.js";
 
@@ -27,6 +25,7 @@ export class WatchScheduler {
     private readonly checkService: WatchCheckService,
     private readonly options: WatchSchedulerOptions,
     private readonly screenMessages: ScreenMessageRegistry,
+    private readonly visualEvidence: VisualEvidenceService,
   ) {}
 
   start(): void {
@@ -105,14 +104,13 @@ export class WatchScheduler {
     for (const item of pendingItems) {
       const attemptedAt = new Date().toISOString();
       try {
-        await this.api.sendMessage(
-          item.watch.ownerTelegramId,
-          formatImportantChange(item.watch, item.notification),
-          {
-            link_preview_options: { is_disabled: true },
-            reply_markup: importantNotificationKeyboard(item.watch, item.notification),
-          },
-        );
+        await deliverImportantNotification({
+          api: this.api,
+          chatId: item.watch.ownerTelegramId,
+          watch: item.watch,
+          notification: item.notification,
+          visualEvidence: this.visualEvidence,
+        });
         this.screenMessages.markSeparatedByPermanentMessage(item.watch.ownerTelegramId);
         await this.store.markNotificationDelivered({
           telegramUserId: item.watch.ownerTelegramId,

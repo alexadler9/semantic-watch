@@ -1,23 +1,32 @@
 import { InlineKeyboard } from "grammy";
 import type { PendingNotification, SemanticEvaluation, Watch } from "../domain/models.js";
+import { renderNotificationBlocks } from "./notification-content.js";
 
 export function formatImportantChange(
-  watch: Pick<Watch, "url">,
-  evaluation: Pick<SemanticEvaluation, "summary" | "evidence">,
+  _watch: Pick<Watch, "url" | "policy">,
+  evaluation: Pick<
+    SemanticEvaluation,
+    | "summary"
+    | "notificationFacts"
+    | "notificationBlocks"
+    | "resultTitle"
+    | "resultItems"
+    | "evidence"
+  >,
   duplicate = false,
 ): string {
   const header = duplicate
     ? "Этот результат уже отправлялся ранее."
     : "На странице появилась нужная информация.";
 
-  return [
-    header,
-    "",
-    evaluation.summary,
-    "",
-    "Подтверждение на странице:",
-    ...evaluation.evidence.map((quote) => `• ${quote}`),
-  ].join("\n");
+  const renderedContent = renderNotificationBlocks(
+    evaluation.notificationFacts,
+    evaluation.notificationBlocks,
+  );
+
+  // Structured content replaces summary instead of being appended to it. This
+  // prevents the same price, percentage or list item from appearing twice.
+  return [header, "", renderedContent ?? evaluation.summary].join("\n");
 }
 
 export function importantNotificationKeyboard(

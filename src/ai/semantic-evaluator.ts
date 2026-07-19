@@ -1,5 +1,10 @@
 import { z } from "zod";
-import type { SemanticEvaluation, WatchPolicy } from "../domain/models.js";
+import type {
+  NotificationFact,
+  NotificationMessageBlock,
+  SemanticEvaluation,
+  WatchPolicy,
+} from "../domain/models.js";
 import { JsonStore } from "../storage/json-store.js";
 import { truncate } from "../utils/text.js";
 import { DeepSeekClient } from "./deepseek-client.js";
@@ -14,6 +19,8 @@ const watchPolicySchema = z.object({
   targetEvent: z.string().trim().min(3).max(500),
   requiredSignals: z.array(z.string().trim().min(2).max(300)).min(1).max(8),
   ignoredChanges: z.array(z.string().trim().min(2).max(300)).max(8),
+  requestedOutput: z.string().trim().min(2).max(300).nullable(),
+  notificationInstruction: z.string().trim().min(2).max(300).nullable(),
 });
 
 const policyEnvelopeSchema = z.object({
@@ -24,14 +31,61 @@ const policyEnvelopeSchema = z.object({
   targetEvent: z.string().optional(),
   requiredSignals: z.array(z.string()).optional(),
   ignoredChanges: z.array(z.string()).optional(),
+  requestedOutput: z.string().nullable().optional(),
+  notificationInstruction: z.string().nullable().optional(),
   currentState: z.string().optional(),
 });
+
+const notificationFactSchema = z.object({
+  id: z.string().trim().min(1).max(64),
+  label: z.string().trim().min(1).max(100).nullable().optional(),
+  value: z.string().trim().min(1).max(500),
+});
+
+const notificationPartSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("TEXT"), text: z.string().max(160) }),
+  z.object({ kind: z.literal("FACT"), factId: z.string().trim().min(1).max(64) }),
+]);
+
+const notificationBlockSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("PARAGRAPH"),
+    parts: z.array(notificationPartSchema).min(1).max(20),
+  }),
+  z.object({
+    type: z.literal("LIST"),
+    title: z.string().trim().min(1).max(120).nullable().optional(),
+    factIds: z.array(z.string().trim().min(1).max(64)).min(1).max(16),
+  }),
+  z.object({
+    type: z.literal("KEY_VALUE"),
+    title: z.string().trim().min(1).max(120).nullable().optional(),
+    rows: z
+      .array(
+        z.object({
+          label: z.string().trim().min(1).max(100),
+          factId: z.string().trim().min(1).max(64),
+        }),
+      )
+      .min(1)
+      .max(16),
+  }),
+  z.object({
+    type: z.literal("QUOTE"),
+    factId: z.string().trim().min(1).max(64),
+  }),
+]);
 
 const evaluationEnvelopeSchema = z.object({
   meaningfulChange: z.boolean(),
   conditionMatched: z.boolean(),
   confidence: z.number().min(0).max(1),
   summary: z.string().min(1).max(600),
+  notificationFacts: z.array(notificationFactSchema).max(16).optional(),
+  notificationBlocks: z.array(notificationBlockSchema).max(8).optional(),
+  // Backward-compatible fields for a model response produced from an older prompt.
+  resultTitle: z.string().trim().min(2).max(120).nullable().optional(),
+  resultItems: z.array(z.string().trim().min(1).max(500)).max(16).optional(),
   evidence: z.array(z.string().min(2).max(300)).max(5),
   currentState: z.string().trim().min(2).max(500).optional(),
 });
@@ -52,6 +106,8 @@ const refinedPolicySchema = z.object({
   targetEvent: z.string().trim().min(3).max(500),
   requiredSignals: z.array(z.string().trim().min(2).max(300)).min(1).max(8),
   ignoredChanges: z.array(z.string().trim().min(2).max(300)).max(8),
+  requestedOutput: z.string().trim().min(2).max(300).nullable().optional(),
+  notificationInstruction: z.string().trim().min(2).max(300).nullable().optional(),
   explanation: z.string().trim().min(3).max(500),
 });
 
@@ -178,8 +234,44 @@ export class SemanticEvaluator {
     );
 
     const parsed = evaluationEnvelopeSchema.parse(payload);
+    let notificationFacts = parsed.conditionMatched
+      ? cleanNotificationFacts(parsed.notificationFacts)
+      : [];
+    let notificationBlocks = parsed.conditionMatched
+      ? cleanNotificationBlocks(parsed.notificationBlocks)
+      : [];
+
+    const legacyResultItems = parsed.conditionMatched
+      ? cleanStringArray(parsed.resultItems, 16)
+      : [];
+    if (notificationFacts.length === 0 && legacyResultItems.length > 0) {
+      notificationFacts = legacyResultItems.map((value, index) => ({
+        id: `result_${index + 1}`,
+        label: null,
+        value,
+      }));
+    }
+    if (notificationBlocks.length === 0 && notificationFacts.length > 0) {
+      notificationBlocks = fallbackBlocks(
+        notificationFacts,
+        cleanOptionalText(parsed.resultTitle) ?? input.policy.requestedOutput,
+      );
+    }
+
+    const resultItems = notificationFacts.map((fact) => fact.value);
     return {
-      ...parsed,
+      meaningfulChange: parsed.meaningfulChange,
+      conditionMatched: parsed.conditionMatched,
+      confidence: parsed.confidence,
+      summary: parsed.summary,
+      notificationFacts,
+      notificationBlocks,
+      resultTitle:
+        resultItems.length > 0
+          ? cleanOptionalText(parsed.resultTitle) ?? input.policy.requestedOutput
+          : null,
+      resultItems,
+      evidence: parsed.conditionMatched ? parsed.evidence : [],
       currentState: parsed.currentState ?? parsed.summary,
     };
   }
@@ -188,6 +280,7 @@ export class SemanticEvaluator {
     instruction: string;
     policy: WatchPolicy;
     summary: string;
+    resultItems: string[];
     evidence: string[];
   }): Promise<FeedbackReason[]> {
     await this.reserveCall();
@@ -197,7 +290,8 @@ export class SemanticEvaluator {
         `Пользовательская задача:\n${input.instruction}`,
         `\nТекущее правило:\n${JSON.stringify(input.policy, null, 2)}`,
         `\nОтправленный результат:\n${input.summary}`,
-        `\nПодтверждения со страницы:\n${input.evidence.map((item) => `- ${item}`).join("\n")}`,
+        `\nДанные, показанные пользователю:\n${input.resultItems.map((item) => `- ${item}`).join("\n") || "не было"}`,
+        `\nВнутренние подтверждения со страницы:\n${input.evidence.map((item) => `- ${item}`).join("\n")}`,
       ].join("\n"),
     );
     return feedbackReasonsSchema.parse(payload).reasons;
@@ -207,6 +301,7 @@ export class SemanticEvaluator {
     instruction: string;
     currentPolicy: WatchPolicy;
     resultSummary: string;
+    resultItems: string[];
     evidence: string[];
     userClarification: string;
   }): Promise<RefinedPolicy> {
@@ -217,7 +312,8 @@ export class SemanticEvaluator {
         `Исходная задача пользователя:\n${input.instruction}`,
         `\nТекущее правило:\n${JSON.stringify(input.currentPolicy, null, 2)}`,
         `\nРезультат, который не подошёл:\n${input.resultSummary}`,
-        `\nПодтверждения со страницы:\n${input.evidence.map((item) => `- ${item}`).join("\n")}`,
+        `\nДанные, показанные пользователю:\n${input.resultItems.map((item) => `- ${item}`).join("\n") || "не было"}`,
+        `\nВнутренние подтверждения со страницы:\n${input.evidence.map((item) => `- ${item}`).join("\n")}`,
         `\nУточнение пользователя:\n${input.userClarification}`,
       ].join("\n"),
     );
@@ -228,6 +324,14 @@ export class SemanticEvaluator {
         targetEvent: parsed.targetEvent,
         requiredSignals: parsed.requiredSignals,
         ignoredChanges: parsed.ignoredChanges,
+        requestedOutput:
+          parsed.requestedOutput === undefined
+            ? input.currentPolicy.requestedOutput
+            : cleanOptionalText(parsed.requestedOutput),
+        notificationInstruction:
+          parsed.notificationInstruction === undefined
+            ? input.currentPolicy.notificationInstruction
+            : cleanOptionalText(parsed.notificationInstruction),
       },
       explanation: parsed.explanation,
     };
@@ -245,13 +349,102 @@ function parsePolicy(value: z.infer<typeof policyEnvelopeSchema>): WatchPolicy |
   const targetEvent = value.targetEvent?.trim() ?? "";
   const requiredSignals = cleanStringArray(value.requiredSignals, 8);
   const ignoredChanges = cleanStringArray(value.ignoredChanges, 8);
+  const requestedOutput = cleanOptionalText(value.requestedOutput);
+  const notificationInstruction = cleanOptionalText(value.notificationInstruction);
 
   const parsed = watchPolicySchema.safeParse({
     targetEvent,
     requiredSignals,
     ignoredChanges,
+    requestedOutput,
+    notificationInstruction,
   });
   return parsed.success ? parsed.data : null;
+}
+
+function cleanNotificationFacts(
+  value: z.infer<typeof notificationFactSchema>[] | undefined,
+): NotificationFact[] {
+  const result: NotificationFact[] = [];
+  const ids = new Set<string>();
+  for (const item of value ?? []) {
+    const id = normalizeFactId(item.id, result.length + 1);
+    if (ids.has(id)) continue;
+    ids.add(id);
+    result.push({
+      id,
+      label: cleanOptionalText(item.label),
+      value: item.value.trim(),
+    });
+  }
+  return result.slice(0, 16);
+}
+
+function cleanNotificationBlocks(
+  value: z.infer<typeof notificationBlockSchema>[] | undefined,
+): NotificationMessageBlock[] {
+  return (value ?? []).map((block) => {
+    switch (block.type) {
+      case "PARAGRAPH":
+        return {
+          type: "PARAGRAPH" as const,
+          parts: block.parts.map((part) =>
+            part.kind === "TEXT"
+              ? { kind: "TEXT" as const, text: part.text }
+              : { kind: "FACT" as const, factId: normalizeFactId(part.factId, 1) },
+          ),
+        };
+      case "LIST":
+        return {
+          type: "LIST" as const,
+          title: cleanOptionalText(block.title),
+          factIds: block.factIds.map((id) => normalizeFactId(id, 1)),
+        };
+      case "KEY_VALUE":
+        return {
+          type: "KEY_VALUE" as const,
+          title: cleanOptionalText(block.title),
+          rows: block.rows.map((row) => ({
+            label: row.label.trim(),
+            factId: normalizeFactId(row.factId, 1),
+          })),
+        };
+      case "QUOTE":
+        return {
+          type: "QUOTE" as const,
+          factId: normalizeFactId(block.factId, 1),
+        };
+    }
+  });
+}
+
+function fallbackBlocks(
+  facts: NotificationFact[],
+  title: string | null,
+): NotificationMessageBlock[] {
+  if (facts.length === 1) {
+    const first = facts[0];
+    return first
+      ? [{ type: "PARAGRAPH", parts: [{ kind: "FACT", factId: first.id }] }]
+      : [];
+  }
+  return [
+    {
+      type: "LIST",
+      title,
+      factIds: facts.map((fact) => fact.id),
+    },
+  ];
+}
+
+function normalizeFactId(value: string, fallbackIndex: number): string {
+  const normalized = value
+    .trim()
+    .toLocaleLowerCase("en-US")
+    .replace(/[^a-z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 64);
+  return normalized || `fact_${fallbackIndex}`;
 }
 
 function cleanStringArray(value: string[] | undefined, max: number): string[] {
@@ -261,7 +454,7 @@ function cleanStringArray(value: string[] | undefined, max: number): string[] {
     .slice(0, max);
 }
 
-function cleanOptionalText(value: string | undefined): string | null {
+function cleanOptionalText(value: string | null | undefined): string | null {
   const normalized = value?.trim();
   return normalized ? normalized : null;
 }
