@@ -1,3 +1,4 @@
+import { InlineKeyboard } from "grammy";
 import type { SemanticEvaluation, Watch } from "../domain/models.js";
 
 export function formatImportantChange(
@@ -6,8 +7,8 @@ export function formatImportantChange(
   duplicate = false,
 ): string {
   const header = duplicate
-    ? "Это изменение уже было отправлено ранее."
-    : "Обнаружено важное изменение.";
+    ? "Этот результат уже отправлялся ранее."
+    : "На странице появилась нужная информация.";
 
   return [
     header,
@@ -16,7 +17,14 @@ export function formatImportantChange(
     "",
     "Подтверждение на странице:",
     ...evaluation.evidence.map((quote) => `• ${quote}`),
-    "",
-    watch.url,
   ].join("\n");
+}
+
+export function importantNotificationKeyboard(
+  watch: Pick<Watch, "id" | "url">,
+): InlineKeyboard {
+  return new InlineKeyboard()
+    .url("Открыть страницу", watch.url)
+    .row()
+    .text("Приостановить отслеживание", `page:pause:${watch.id}`);
 }

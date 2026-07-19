@@ -65,6 +65,13 @@ export class JsonStore {
     });
   }
 
+  async countTrackedWatches(telegramUserId: string): Promise<number> {
+    const store = await this.readStore();
+    return store.watches.filter(
+      (watch) => watch.ownerTelegramId === telegramUserId && watch.status !== "STOPPED",
+    ).length;
+  }
+
   async countActiveWatches(telegramUserId: string): Promise<number> {
     const store = await this.readStore();
     return store.watches.filter(
@@ -76,6 +83,13 @@ export class JsonStore {
     await this.mutate((store) => {
       store.watches.push(watch);
     });
+  }
+
+  async listTrackedWatches(telegramUserId: string): Promise<Watch[]> {
+    const store = await this.readStore();
+    return store.watches
+      .filter((watch) => watch.ownerTelegramId === telegramUserId && watch.status !== "STOPPED")
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   }
 
   async listActiveWatches(telegramUserId: string): Promise<Watch[]> {
@@ -121,6 +135,18 @@ export class JsonStore {
       .flatMap((watch) =>
         watch.pendingNotification ? [{ watch, notification: watch.pendingNotification }] : [],
       );
+  }
+
+  async findTrackedWatch(telegramUserId: string, watchId: string): Promise<Watch | null> {
+    const store = await this.readStore();
+    return (
+      store.watches.find(
+        (watch) =>
+          watch.ownerTelegramId === telegramUserId &&
+          watch.id === watchId &&
+          watch.status !== "STOPPED",
+      ) ?? null
+    );
   }
 
   async findActiveWatch(telegramUserId: string, watchId: string): Promise<Watch | null> {
@@ -302,8 +328,8 @@ export class JsonStore {
     return result;
   }
 
-  async stopWatch(telegramUserId: string, watchId: string): Promise<boolean> {
-    let stopped = false;
+  async pauseWatch(telegramUserId: string, watchId: string): Promise<boolean> {
+    let paused = false;
     await this.mutate((store) => {
       const watch = store.watches.find(
         (item) =>
@@ -311,15 +337,50 @@ export class JsonStore {
           item.ownerTelegramId === telegramUserId &&
           item.status === "ACTIVE",
       );
-      if (!watch) {
-        return;
-      }
+      if (!watch) return;
+      watch.status = "PAUSED";
+      paused = true;
+    });
+    return paused;
+  }
+
+  async resumeWatch(telegramUserId: string, watchId: string): Promise<boolean> {
+    let resumed = false;
+    await this.mutate((store) => {
+      const watch = store.watches.find(
+        (item) =>
+          item.id === watchId &&
+          item.ownerTelegramId === telegramUserId &&
+          item.status === "PAUSED",
+      );
+      if (!watch) return;
+      watch.status = "ACTIVE";
+      watch.nextCheckAt = new Date().toISOString();
+      resumed = true;
+    });
+    return resumed;
+  }
+
+  async deleteWatch(telegramUserId: string, watchId: string): Promise<boolean> {
+    let deleted = false;
+    await this.mutate((store) => {
+      const watch = store.watches.find(
+        (item) =>
+          item.id === watchId &&
+          item.ownerTelegramId === telegramUserId &&
+          item.status !== "STOPPED",
+      );
+      if (!watch) return;
       watch.status = "STOPPED";
       watch.stoppedAt = new Date().toISOString();
       watch.pendingNotification = null;
-      stopped = true;
+      deleted = true;
     });
-    return stopped;
+    return deleted;
+  }
+
+  async stopWatch(telegramUserId: string, watchId: string): Promise<boolean> {
+    return this.deleteWatch(telegramUserId, watchId);
   }
 
   private async readStore(): Promise<StoreData> {
@@ -355,6 +416,7 @@ function normalizeWatch(value: Watch): Watch {
 
   return {
     ...value,
+    status: normalizeWatchStatus(value.status),
     policy: value.policy ?? null,
     lastNotificationFingerprint: value.lastNotificationFingerprint ?? null,
     pendingNotification: normalizePendingNotification(value.pendingNotification),
@@ -364,6 +426,11 @@ function normalizeWatch(value: Watch): Watch {
       : 0,
     lastCheckError: value.lastCheckError ?? null,
   };
+}
+
+function normalizeWatchStatus(value: Watch["status"] | undefined): Watch["status"] {
+  if (value === "PAUSED" || value === "STOPPED") return value;
+  return "ACTIVE";
 }
 
 function normalizePendingNotification(

@@ -1,6 +1,9 @@
 import type { Api } from "grammy";
 import { WatchCheckInProgressError, WatchCheckService } from "../checker/watch-check-service.js";
-import { formatImportantChange } from "../notifications/telegram-messages.js";
+import {
+  formatImportantChange,
+  importantNotificationKeyboard,
+} from "../notifications/telegram-messages.js";
 import { JsonStore } from "../storage/json-store.js";
 import { truncate } from "../utils/text.js";
 import { addMinutesIso } from "../utils/time.js";
@@ -103,7 +106,10 @@ export class WatchScheduler {
         await this.api.sendMessage(
           item.watch.ownerTelegramId,
           formatImportantChange(item.watch, item.notification),
-          { link_preview_options: { is_disabled: true } },
+          {
+            link_preview_options: { is_disabled: true },
+            reply_markup: importantNotificationKeyboard(item.watch),
+          },
         );
         await this.store.markNotificationDelivered({
           telegramUserId: item.watch.ownerTelegramId,

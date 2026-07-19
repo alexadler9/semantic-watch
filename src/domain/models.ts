@@ -1,4 +1,4 @@
-export type WatchStatus = "ACTIVE" | "STOPPED";
+export type WatchStatus = "ACTIVE" | "PAUSED" | "STOPPED";
 
 export interface AuthorizedUser {
   telegramUserId: string;

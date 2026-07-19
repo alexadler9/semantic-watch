@@ -47,7 +47,7 @@ export class SemanticEvaluator {
       EVALUATION_SYSTEM_PROMPT,
       [
         `Исходная инструкция пользователя:\n${input.instruction}`,
-        `\nСтруктурированное правило наблюдения (JSON):\n${JSON.stringify(input.policy, null, 2)}`,
+        `\nСтруктурированное правило отслеживания (JSON):\n${JSON.stringify(input.policy, null, 2)}`,
         `\nИзменение текста страницы:\n${input.diff}`,
       ].join("\n"),
     );
@@ -63,7 +63,7 @@ export class SemanticEvaluator {
 }
 
 const POLICY_SYSTEM_PROMPT = `
-Ты формируешь правило семантического мониторинга веб-страницы.
+Ты формируешь правило семантического отслеживания веб-страницы.
 Верни только один JSON-объект без markdown и пояснений.
 
 Нужно понять:

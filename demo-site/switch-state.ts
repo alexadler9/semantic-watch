@@ -3,9 +3,9 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const state = process.argv[2];
-const allowedStates = new Set(["closed", "speakers", "open"]);
+const allowedStates = new Set(["closed", "speakers", "partners", "waitlist", "open"]);
 if (!state || !allowedStates.has(state)) {
-  console.error("Usage: tsx demo-site/switch-state.ts <closed|speakers|open>");
+  console.error("Usage: tsx demo-site/switch-state.ts <closed|speakers|partners|waitlist|open>");
   process.exit(1);
 }
 

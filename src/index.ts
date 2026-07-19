@@ -44,12 +44,11 @@ async function main(): Promise<void> {
   });
 
   await bot.api.setMyCommands([
-    { command: "start", description: "Описание сервиса" },
-    { command: "watch", description: "Создать наблюдение" },
-    { command: "list", description: "Активные наблюдения" },
-    { command: "check", description: "Проверить страницу сейчас" },
-    { command: "stop", description: "Остановить наблюдение по ID" },
-    { command: "cancel", description: "Отменить текущий диалог" },
+    { command: "start", description: "Открыть главное меню" },
+    { command: "watch", description: "Добавить страницу" },
+    { command: "list", description: "Показать отслеживаемые страницы" },
+    { command: "check", description: "Проверить активную страницу сейчас" },
+    { command: "cancel", description: "Отменить текущую настройку" },
   ]);
 
   if (config.schedulerEnabled) {

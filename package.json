@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Telegram service for semantic monitoring of meaningful web page changes.",
+  "description": "Telegram service for semantic tracking of relevant information on public web pages.",
   "engines": {
     "node": ">=20.18.0"
   },
@@ -16,7 +16,9 @@
     "demo": "tsx demo-site/server.ts",
     "demo:closed": "tsx demo-site/switch-state.ts closed",
     "demo:speakers": "tsx demo-site/switch-state.ts speakers",
-    "demo:open": "tsx demo-site/switch-state.ts open"
+    "demo:open": "tsx demo-site/switch-state.ts open",
+    "demo:partners": "tsx demo-site/switch-state.ts partners",
+    "demo:waitlist": "tsx demo-site/switch-state.ts waitlist"
   },
   "dependencies": {
     "cheerio": "1.2.0",
