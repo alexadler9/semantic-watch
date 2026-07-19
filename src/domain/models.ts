@@ -19,6 +19,17 @@ export interface SemanticEvaluation {
   evidence: string[];
 }
 
+export interface PendingNotification {
+  fingerprint: string;
+  summary: string;
+  evidence: string[];
+  createdAt: string;
+  nextAttemptAt: string;
+  attempts: number;
+  lastAttemptAt: string | null;
+  lastError: string | null;
+}
+
 export interface Watch {
   id: string;
   ownerTelegramId: string;
@@ -29,9 +40,13 @@ export interface Watch {
   createdAt: string;
   stoppedAt: string | null;
   lastCheckedAt: string;
+  nextCheckAt: string;
   lastContentHash: string;
   lastSnapshot: string;
   lastNotificationFingerprint: string | null;
+  pendingNotification: PendingNotification | null;
+  consecutiveFailures: number;
+  lastCheckError: string | null;
   pageTitle: string | null;
 }
 

@@ -6,6 +6,12 @@ const booleanFromEnv = z
   .optional()
   .transform((value) => value?.trim().toLowerCase() === "true");
 
+const booleanDefaultTrueFromEnv = z
+  .string()
+  .optional()
+  .transform((value) => value === undefined || value.trim().toLowerCase() === "true");
+
+
 const envSchema = z.object({
   TELEGRAM_BOT_TOKEN: z.string().min(1),
   TELEGRAM_OWNER_IDS: z.string().optional().default(""),
@@ -22,6 +28,13 @@ const envSchema = z.object({
   DEEPSEEK_BASE_URL: z.string().url().optional().default("https://api.deepseek.com"),
   DEEPSEEK_MODEL: z.string().min(1).optional().default("deepseek-v4-flash"),
   DEEPSEEK_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120_000).default(30_000),
+  SCHEDULER_ENABLED: booleanDefaultTrueFromEnv,
+  SCHEDULER_TICK_SECONDS: z.coerce.number().int().min(10).max(3600).default(60),
+  DEFAULT_CHECK_INTERVAL_MINUTES: z.coerce.number().int().min(1).max(1440).default(30),
+  ERROR_RETRY_MINUTES: z.coerce.number().int().min(1).max(1440).default(5),
+  NOTIFICATION_RETRY_MINUTES: z.coerce.number().int().min(1).max(1440).default(5),
+  MAX_CHECKS_PER_TICK: z.coerce.number().int().min(1).max(100).default(10),
+  MAX_NOTIFICATION_ATTEMPTS: z.coerce.number().int().min(1).max(20).default(5),
   DEMO_MODE: booleanFromEnv,
   DEMO_URL: z.string().url().optional().default("http://127.0.0.1:3001/"),
 });
@@ -61,6 +74,13 @@ export interface AppConfig {
   deepSeekBaseUrl: string;
   deepSeekModel: string;
   deepSeekTimeoutMs: number;
+  schedulerEnabled: boolean;
+  schedulerTickSeconds: number;
+  defaultCheckIntervalMinutes: number;
+  errorRetryMinutes: number;
+  notificationRetryMinutes: number;
+  maxChecksPerTick: number;
+  maxNotificationAttempts: number;
   demoMode: boolean;
   demoUrl: string;
 }
@@ -81,6 +101,13 @@ export const config: AppConfig = {
   deepSeekBaseUrl: parsed.data.DEEPSEEK_BASE_URL.replace(/\/+$/, ""),
   deepSeekModel: parsed.data.DEEPSEEK_MODEL,
   deepSeekTimeoutMs: parsed.data.DEEPSEEK_TIMEOUT_MS,
+  schedulerEnabled: parsed.data.SCHEDULER_ENABLED,
+  schedulerTickSeconds: parsed.data.SCHEDULER_TICK_SECONDS,
+  defaultCheckIntervalMinutes: parsed.data.DEFAULT_CHECK_INTERVAL_MINUTES,
+  errorRetryMinutes: parsed.data.ERROR_RETRY_MINUTES,
+  notificationRetryMinutes: parsed.data.NOTIFICATION_RETRY_MINUTES,
+  maxChecksPerTick: parsed.data.MAX_CHECKS_PER_TICK,
+  maxNotificationAttempts: parsed.data.MAX_NOTIFICATION_ATTEMPTS,
   demoMode: parsed.data.DEMO_MODE,
   demoUrl: new URL(parsed.data.DEMO_URL).toString(),
 };

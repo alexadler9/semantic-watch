@@ -1,12 +1,18 @@
 import { randomUUID } from "node:crypto";
 import { Bot, type Context } from "grammy";
 import type { SemanticEvaluator } from "../ai/semantic-evaluator.js";
-import type { WatchCheckResult, WatchCheckService } from "../checker/watch-check-service.js";
+import {
+  WatchCheckInProgressError,
+  type WatchCheckResult,
+  type WatchCheckService,
+} from "../checker/watch-check-service.js";
 import type { AppConfig } from "../config/config.js";
 import type { Watch } from "../domain/models.js";
 import { SafePageFetcher } from "../fetcher/safe-page-fetcher.js";
+import { formatImportantChange } from "../notifications/telegram-messages.js";
 import { JsonStore } from "../storage/json-store.js";
 import { normalizeInstruction, truncate } from "../utils/text.js";
+import { addMinutesIso } from "../utils/time.js";
 import { AccessService } from "./access-service.js";
 
 interface PendingWatch {
@@ -81,17 +87,8 @@ export function createBot(
       return;
     }
 
-    const message = watches
-      .map(
-        (watch, index) =>
-          `${index + 1}. ${watch.pageTitle ?? new URL(watch.url).hostname}\n` +
-          `ID: ${watch.id}\n` +
-          `URL: ${watch.url}\n` +
-          `Отслеживаем: ${truncate(watch.policy?.targetEvent ?? watch.instruction, 180)}\n` +
-          `Проверено: ${formatDate(watch.lastCheckedAt)}`,
-      )
-      .join("\n\n");
-    await ctx.reply(message);
+    const message = watches.map(formatWatchListItem).join("\n\n");
+    await ctx.reply(message, { link_preview_options: { is_disabled: true } });
   });
 
   bot.command("check", async (ctx) => {
@@ -104,11 +101,38 @@ export function createBot(
       return;
     }
 
+    if (watch.pendingNotification) {
+      await ctx.reply(
+        formatImportantChange(watch, watch.pendingNotification),
+        { link_preview_options: { is_disabled: true } },
+      );
+      await store.markNotificationDelivered({
+        telegramUserId: userId,
+        watchId: watch.id,
+        fingerprint: watch.pendingNotification.fingerprint,
+      });
+      return;
+    }
+
     await ctx.reply(`Проверяю страницу «${watch.pageTitle ?? new URL(watch.url).hostname}»…`);
     try {
       const result = await checkService.check(watch);
-      await ctx.reply(formatCheckResult(result));
+      await ctx.reply(formatCheckResult(result), {
+        link_preview_options: { is_disabled: true },
+      });
+
+      if (result.kind === "MATCH" && !result.duplicate) {
+        await store.markNotificationDelivered({
+          telegramUserId: userId,
+          watchId: watch.id,
+          fingerprint: result.notificationFingerprint,
+        });
+      }
     } catch (error) {
+      if (error instanceof WatchCheckInProgressError) {
+        await ctx.reply("Эта страница уже проверяется в фоне. Попробуйте ещё раз через несколько секунд.");
+        return;
+      }
       await ctx.reply(`Не удалось выполнить проверку: ${toSafeErrorMessage(error)}`);
     }
   });
@@ -124,7 +148,9 @@ export function createBot(
     }
 
     const stopped = await store.stopWatch(userId, watchId);
-    await ctx.reply(stopped ? `Наблюдение ${watchId} остановлено.` : "Активное наблюдение с таким ID не найдено.");
+    await ctx.reply(
+      stopped ? `Наблюдение ${watchId} остановлено.` : "Активное наблюдение с таким ID не найдено.",
+    );
   });
 
   bot.command("cancel", async (ctx) => {
@@ -154,7 +180,9 @@ export function createBot(
           "На что нужно обращать внимание? Опишите, о каком изменении сообщить и какие изменения можно игнорировать.",
         );
       } catch {
-        await ctx.reply("Не удалось распознать ссылку. Отправьте полный URL, начинающийся с http:// или https://.");
+        await ctx.reply(
+          "Не удалось распознать ссылку. Отправьте полный URL, начинающийся с http:// или https://.",
+        );
       }
       return;
     }
@@ -192,9 +220,13 @@ export function createBot(
         createdAt: now,
         stoppedAt: null,
         lastCheckedAt: snapshot.fetchedAt,
+        nextCheckAt: addMinutesIso(snapshot.fetchedAt, appConfig.defaultCheckIntervalMinutes),
         lastContentHash: snapshot.hash,
         lastSnapshot: snapshot.text,
         lastNotificationFingerprint: null,
+        pendingNotification: null,
+        consecutiveFailures: 0,
+        lastCheckError: null,
         pageTitle: snapshot.title,
       };
       await store.createWatch(watch);
@@ -208,7 +240,9 @@ export function createBot(
           `Отслеживаем: ${policy.targetEvent}\n` +
           formatOptionalList("Признаки", policy.requiredSignals) +
           formatOptionalList("Игнорируем", policy.ignoredChanges) +
+          `\nСледующая автоматическая проверка: ${formatDate(watch.nextCheckAt)}.` +
           `\nТекущее содержимое сохранено как исходное состояние.`,
+        { link_preview_options: { is_disabled: true } },
       );
     } catch (error) {
       pendingWatches.set(userId, { step: "WAITING_INSTRUCTION", url });
@@ -265,22 +299,28 @@ function formatCheckResult(result: WatchCheckResult): string {
         : "Страница изменилась, но отслеживаемое условие не выполнено.";
       return [header, "", result.evaluation.summary].join("\n");
     }
-    case "MATCH": {
-      const header = result.duplicate
-        ? "Это изменение уже было отправлено ранее."
-        : "Обнаружено важное изменение.";
-      return [
-        header,
-        "",
-        result.evaluation.summary,
-        "",
-        "Подтверждение на странице:",
-        ...result.evaluation.evidence.map((quote) => `• ${quote}`),
-        "",
-        result.watch.url,
-      ].join("\n");
-    }
+    case "MATCH":
+      return formatImportantChange(result.watch, result.evaluation, result.duplicate);
   }
+}
+
+function formatWatchListItem(watch: Watch, index: number): string {
+  const details = [
+    `${index + 1}. ${watch.pageTitle ?? new URL(watch.url).hostname}`,
+    `ID: ${watch.id}`,
+    `URL: ${watch.url}`,
+    `Отслеживаем: ${truncate(watch.policy?.targetEvent ?? watch.instruction, 180)}`,
+    `Проверено: ${formatDate(watch.lastCheckedAt)}`,
+    `Следующая проверка: ${formatDate(watch.nextCheckAt)}`,
+  ];
+
+  if (watch.pendingNotification) {
+    details.push("Уведомление ожидает доставки.");
+  }
+  if (watch.lastCheckError) {
+    details.push(`Последняя ошибка: ${truncate(watch.lastCheckError, 160)}`);
+  }
+  return details.join("\n");
 }
 
 async function requireAccess(ctx: Context, accessService: AccessService): Promise<string | null> {
@@ -330,6 +370,7 @@ function unauthorizedText(userId: string, activationEnabled: boolean): string {
 function helpText(): string {
   return [
     "Semantic Watch отслеживает значимые изменения публичных веб-страниц.",
+    "Проверки выполняются автоматически; /check запускает внеплановую проверку.",
     "",
     "/watch — создать наблюдение",
     "/list — показать активные наблюдения",

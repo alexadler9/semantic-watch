@@ -1,21 +1,38 @@
-import type { SemanticEvaluation, Watch } from "../domain/models.js";
+import type { PendingNotification, SemanticEvaluation, Watch } from "../domain/models.js";
 import { SafePageFetcher } from "../fetcher/safe-page-fetcher.js";
 import { JsonStore } from "../storage/json-store.js";
 import { sha256 } from "../utils/hash.js";
 import { buildTextDiff } from "../utils/text-diff.js";
+import { addMinutesIso } from "../utils/time.js";
 import { SemanticEvaluator } from "../ai/semantic-evaluator.js";
 
 export type WatchCheckResult =
   | { kind: "UNCHANGED"; watch: Watch }
   | { kind: "NO_MATCH"; watch: Watch; evaluation: SemanticEvaluation }
-  | { kind: "MATCH"; watch: Watch; evaluation: SemanticEvaluation; duplicate: boolean };
+  | {
+      kind: "MATCH";
+      watch: Watch;
+      evaluation: SemanticEvaluation;
+      duplicate: boolean;
+      notificationFingerprint: string;
+    };
 
 export interface WatchCheckServiceOptions {
   maxDiffChars: number;
   matchConfidenceThreshold: number;
+  checkIntervalMinutes: number;
+}
+
+export class WatchCheckInProgressError extends Error {
+  constructor(watchId: string) {
+    super(`Watch ${watchId} is already being checked.`);
+    this.name = "WatchCheckInProgressError";
+  }
 }
 
 export class WatchCheckService {
+  private readonly runningWatchIds = new Set<string>();
+
   constructor(
     private readonly store: JsonStore,
     private readonly pageFetcher: SafePageFetcher,
@@ -24,14 +41,30 @@ export class WatchCheckService {
   ) {}
 
   async check(watch: Watch): Promise<WatchCheckResult> {
+    if (this.runningWatchIds.has(watch.id)) {
+      throw new WatchCheckInProgressError(watch.id);
+    }
+
+    this.runningWatchIds.add(watch.id);
+    try {
+      return await this.checkUnlocked(watch);
+    } finally {
+      this.runningWatchIds.delete(watch.id);
+    }
+  }
+
+  private async checkUnlocked(watch: Watch): Promise<WatchCheckResult> {
     const snapshot = await this.pageFetcher.fetch(watch.url);
+    const nextCheckAt = addMinutesIso(snapshot.fetchedAt, this.options.checkIntervalMinutes);
+
     if (snapshot.hash === watch.lastContentHash) {
-      await this.store.touchWatchCheck(
-        watch.ownerTelegramId,
-        watch.id,
-        watch.lastContentHash,
-        snapshot.fetchedAt,
-      );
+      await this.store.touchWatchCheck({
+        telegramUserId: watch.ownerTelegramId,
+        watchId: watch.id,
+        expectedHash: watch.lastContentHash,
+        checkedAt: snapshot.fetchedAt,
+        nextCheckAt,
+      });
       return { kind: "UNCHANGED", watch };
     }
 
@@ -55,12 +88,27 @@ export class WatchCheckService {
       evaluation.conditionMatched &&
       evaluation.confidence >= this.options.matchConfidenceThreshold;
 
-    let fingerprint: string | undefined;
+    let notificationFingerprint: string | undefined;
     let duplicate = false;
+    let pendingNotification: PendingNotification | undefined;
+
     if (matched) {
       validateEvidence(evaluation.evidence, snapshot.text);
-      fingerprint = buildNotificationFingerprint(policy.targetEvent, evaluation.evidence);
-      duplicate = fingerprint === watch.lastNotificationFingerprint;
+      notificationFingerprint = buildNotificationFingerprint(policy.targetEvent, evaluation.evidence);
+      duplicate = notificationFingerprint === watch.lastNotificationFingerprint;
+
+      if (!duplicate) {
+        pendingNotification = {
+          fingerprint: notificationFingerprint,
+          summary: evaluation.summary,
+          evidence: evaluation.evidence,
+          createdAt: snapshot.fetchedAt,
+          nextAttemptAt: snapshot.fetchedAt,
+          attempts: 0,
+          lastAttemptAt: null,
+          lastError: null,
+        };
+      }
     }
 
     const updated = await this.store.updateWatchAfterCheck({
@@ -68,16 +116,37 @@ export class WatchCheckService {
       watchId: watch.id,
       expectedPreviousHash: watch.lastContentHash,
       snapshot,
-      ...(fingerprint !== undefined ? { notificationFingerprint: fingerprint } : {}),
+      nextCheckAt,
+      ...(pendingNotification ? { pendingNotification } : {}),
     });
     if (!updated) {
       throw new Error("Watch changed concurrently. Run the check again.");
     }
 
+    const updatedWatch: Watch = {
+      ...watch,
+      url: snapshot.finalUrl,
+      pageTitle: snapshot.title,
+      lastCheckedAt: snapshot.fetchedAt,
+      nextCheckAt,
+      lastContentHash: snapshot.hash,
+      lastSnapshot: snapshot.text,
+      consecutiveFailures: 0,
+      lastCheckError: null,
+      pendingNotification: pendingNotification ?? null,
+    };
+
     if (!matched) {
-      return { kind: "NO_MATCH", watch, evaluation };
+      return { kind: "NO_MATCH", watch: updatedWatch, evaluation };
     }
-    return { kind: "MATCH", watch, evaluation, duplicate };
+
+    return {
+      kind: "MATCH",
+      watch: updatedWatch,
+      evaluation,
+      duplicate,
+      notificationFingerprint: notificationFingerprint ?? "",
+    };
   }
 }
 

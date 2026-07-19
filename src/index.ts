@@ -4,6 +4,7 @@ import { createBot } from "./bot/create-bot.js";
 import { WatchCheckService } from "./checker/watch-check-service.js";
 import { config } from "./config/config.js";
 import { SafePageFetcher } from "./fetcher/safe-page-fetcher.js";
+import { WatchScheduler } from "./scheduler/watch-scheduler.js";
 import { JsonStore } from "./storage/json-store.js";
 
 async function main(): Promise<void> {
@@ -30,9 +31,17 @@ async function main(): Promise<void> {
   const checkService = new WatchCheckService(store, pageFetcher, semanticEvaluator, {
     maxDiffChars: config.maxDiffChars,
     matchConfidenceThreshold: config.matchConfidenceThreshold,
+    checkIntervalMinutes: config.defaultCheckIntervalMinutes,
   });
 
   const bot = createBot(config, store, pageFetcher, semanticEvaluator, checkService);
+  const scheduler = new WatchScheduler(bot.api, store, checkService, {
+    tickSeconds: config.schedulerTickSeconds,
+    errorRetryMinutes: config.errorRetryMinutes,
+    notificationRetryMinutes: config.notificationRetryMinutes,
+    maxChecksPerTick: config.maxChecksPerTick,
+    maxNotificationAttempts: config.maxNotificationAttempts,
+  });
 
   await bot.api.setMyCommands([
     { command: "start", description: "Описание сервиса" },
@@ -42,6 +51,21 @@ async function main(): Promise<void> {
     { command: "stop", description: "Остановить наблюдение по ID" },
     { command: "cancel", description: "Отменить текущий диалог" },
   ]);
+
+  if (config.schedulerEnabled) {
+    scheduler.start();
+  } else {
+    console.log("Watch scheduler is disabled by configuration.");
+  }
+
+  const shutdown = (): void => {
+    scheduler.stop();
+    void bot.stop().catch((error) => {
+      console.error("Telegram bot shutdown failed:", error);
+    });
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
 
   console.log("Semantic Watch bot started (long polling).");
   await bot.start({

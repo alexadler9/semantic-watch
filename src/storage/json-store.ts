@@ -4,6 +4,7 @@ import type {
   AuthorizedUser,
   LlmUsage,
   PageSnapshot,
+  PendingNotification,
   StoreData,
   Watch,
   WatchPolicy,
@@ -19,6 +20,11 @@ const EMPTY_STORE: StoreData = {
   watches: [],
   llmUsage: EMPTY_USAGE,
 };
+
+export interface PendingNotificationItem {
+  watch: Watch;
+  notification: PendingNotification;
+}
 
 export class JsonStore {
   private readonly filePath: string;
@@ -79,6 +85,44 @@ export class JsonStore {
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   }
 
+  async listDueWatches(nowIso: string, limit: number): Promise<Watch[]> {
+    const store = await this.readStore();
+    return store.watches
+      .filter(
+        (watch) =>
+          watch.status === "ACTIVE" &&
+          watch.pendingNotification === null &&
+          watch.nextCheckAt <= nowIso,
+      )
+      .sort((left, right) => left.nextCheckAt.localeCompare(right.nextCheckAt))
+      .slice(0, limit);
+  }
+
+  async listPendingNotifications(
+    nowIso: string,
+    maxAttempts: number,
+    limit: number,
+  ): Promise<PendingNotificationItem[]> {
+    const store = await this.readStore();
+    return store.watches
+      .filter(
+        (watch) =>
+          watch.status === "ACTIVE" &&
+          watch.pendingNotification !== null &&
+          watch.pendingNotification.nextAttemptAt <= nowIso &&
+          watch.pendingNotification.attempts < maxAttempts,
+      )
+      .sort((left, right) =>
+        (left.pendingNotification?.nextAttemptAt ?? "").localeCompare(
+          right.pendingNotification?.nextAttemptAt ?? "",
+        ),
+      )
+      .slice(0, limit)
+      .flatMap((watch) =>
+        watch.pendingNotification ? [{ watch, notification: watch.pendingNotification }] : [],
+      );
+  }
+
   async findActiveWatch(telegramUserId: string, watchId: string): Promise<Watch | null> {
     const store = await this.readStore();
     return (
@@ -116,7 +160,8 @@ export class JsonStore {
     watchId: string;
     expectedPreviousHash: string;
     snapshot: PageSnapshot;
-    notificationFingerprint?: string;
+    nextCheckAt: string;
+    pendingNotification?: PendingNotification;
   }): Promise<boolean> {
     let updated = false;
     await this.mutate((store) => {
@@ -133,32 +178,108 @@ export class JsonStore {
       watch.url = options.snapshot.finalUrl;
       watch.pageTitle = options.snapshot.title;
       watch.lastCheckedAt = options.snapshot.fetchedAt;
+      watch.nextCheckAt = options.nextCheckAt;
       watch.lastContentHash = options.snapshot.hash;
       watch.lastSnapshot = options.snapshot.text;
-      if (options.notificationFingerprint !== undefined) {
-        watch.lastNotificationFingerprint = options.notificationFingerprint;
-      }
+      watch.consecutiveFailures = 0;
+      watch.lastCheckError = null;
+      watch.pendingNotification = options.pendingNotification ?? null;
       updated = true;
     });
     return updated;
   }
 
-  async touchWatchCheck(
-    telegramUserId: string,
-    watchId: string,
-    expectedHash: string,
-    checkedAt: string,
-  ): Promise<boolean> {
+  async touchWatchCheck(options: {
+    telegramUserId: string;
+    watchId: string;
+    expectedHash: string;
+    checkedAt: string;
+    nextCheckAt: string;
+  }): Promise<boolean> {
     let updated = false;
     await this.mutate((store) => {
       const watch = store.watches.find(
         (item) =>
-          item.id === watchId &&
-          item.ownerTelegramId === telegramUserId &&
+          item.id === options.watchId &&
+          item.ownerTelegramId === options.telegramUserId &&
           item.status === "ACTIVE",
       );
-      if (!watch || watch.lastContentHash !== expectedHash) return;
-      watch.lastCheckedAt = checkedAt;
+      if (!watch || watch.lastContentHash !== options.expectedHash) return;
+      watch.lastCheckedAt = options.checkedAt;
+      watch.nextCheckAt = options.nextCheckAt;
+      watch.consecutiveFailures = 0;
+      watch.lastCheckError = null;
+      updated = true;
+    });
+    return updated;
+  }
+
+  async recordWatchCheckFailure(options: {
+    telegramUserId: string;
+    watchId: string;
+    error: string;
+    nextCheckAt: string;
+  }): Promise<boolean> {
+    let updated = false;
+    await this.mutate((store) => {
+      const watch = store.watches.find(
+        (item) =>
+          item.id === options.watchId &&
+          item.ownerTelegramId === options.telegramUserId &&
+          item.status === "ACTIVE",
+      );
+      if (!watch) return;
+      watch.consecutiveFailures += 1;
+      watch.lastCheckError = options.error;
+      watch.nextCheckAt = options.nextCheckAt;
+      updated = true;
+    });
+    return updated;
+  }
+
+  async markNotificationDelivered(options: {
+    telegramUserId: string;
+    watchId: string;
+    fingerprint: string;
+  }): Promise<boolean> {
+    let updated = false;
+    await this.mutate((store) => {
+      const watch = store.watches.find(
+        (item) =>
+          item.id === options.watchId &&
+          item.ownerTelegramId === options.telegramUserId &&
+          item.status === "ACTIVE",
+      );
+      if (!watch || watch.pendingNotification?.fingerprint !== options.fingerprint) return;
+      watch.lastNotificationFingerprint = options.fingerprint;
+      watch.pendingNotification = null;
+      updated = true;
+    });
+    return updated;
+  }
+
+  async recordNotificationFailure(options: {
+    telegramUserId: string;
+    watchId: string;
+    fingerprint: string;
+    error: string;
+    attemptedAt: string;
+    nextAttemptAt: string;
+  }): Promise<boolean> {
+    let updated = false;
+    await this.mutate((store) => {
+      const watch = store.watches.find(
+        (item) =>
+          item.id === options.watchId &&
+          item.ownerTelegramId === options.telegramUserId &&
+          item.status === "ACTIVE",
+      );
+      const pending = watch?.pendingNotification;
+      if (!watch || !pending || pending.fingerprint !== options.fingerprint) return;
+      pending.attempts += 1;
+      pending.lastAttemptAt = options.attemptedAt;
+      pending.lastError = options.error;
+      pending.nextAttemptAt = options.nextAttemptAt;
       updated = true;
     });
     return updated;
@@ -195,6 +316,7 @@ export class JsonStore {
       }
       watch.status = "STOPPED";
       watch.stoppedAt = new Date().toISOString();
+      watch.pendingNotification = null;
       stopped = true;
     });
     return stopped;
@@ -228,10 +350,36 @@ export class JsonStore {
 }
 
 function normalizeWatch(value: Watch): Watch {
+  const fallbackCheckTime =
+    typeof value.lastCheckedAt === "string" ? value.lastCheckedAt : new Date(0).toISOString();
+
   return {
     ...value,
     policy: value.policy ?? null,
     lastNotificationFingerprint: value.lastNotificationFingerprint ?? null,
+    pendingNotification: normalizePendingNotification(value.pendingNotification),
+    nextCheckAt: value.nextCheckAt ?? fallbackCheckTime,
+    consecutiveFailures: Number.isInteger(value.consecutiveFailures)
+      ? Math.max(0, value.consecutiveFailures)
+      : 0,
+    lastCheckError: value.lastCheckError ?? null,
+  };
+}
+
+function normalizePendingNotification(
+  value: PendingNotification | null | undefined,
+): PendingNotification | null {
+  if (!value || typeof value.fingerprint !== "string") return null;
+  return {
+    fingerprint: value.fingerprint,
+    summary: typeof value.summary === "string" ? value.summary : "Страница изменилась.",
+    evidence: Array.isArray(value.evidence) ? value.evidence.filter((item) => typeof item === "string") : [],
+    createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date().toISOString(),
+    nextAttemptAt:
+      typeof value.nextAttemptAt === "string" ? value.nextAttemptAt : new Date().toISOString(),
+    attempts: Number.isInteger(value.attempts) ? Math.max(0, value.attempts) : 0,
+    lastAttemptAt: typeof value.lastAttemptAt === "string" ? value.lastAttemptAt : null,
+    lastError: typeof value.lastError === "string" ? value.lastError : null,
   };
 }
 
