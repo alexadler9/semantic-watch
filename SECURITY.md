@@ -1,26 +1,63 @@
-# Security notes
+# Безопасность
 
-Stage 1 intentionally supports only public text pages without authentication.
+Semantic Watch работает только с публичными текстовыми веб-страницами без авторизации.
 
-Implemented controls:
+## Контроль доступа
 
-- Telegram allowlist and optional one-time activation key;
-- constant-time comparison for activation keys of equal length;
-- watch ownership checks for list and stop operations;
-- active-watch quota per user;
-- HTTP/HTTPS-only URL policy;
-- private and non-routable address blocking;
-- redirect revalidation;
-- request timeout, response-size and content-type limits;
-- no cookies, credentials or authorization headers;
-- exact local URL exception only when demo mode is enabled;
-- secrets loaded from environment variables.
+- доступ разрешается через `TELEGRAM_OWNER_IDS` или ключ активации;
+- после активации Telegram ID сохраняется в локальном хранилище;
+- ключ сравнивается через constant-time comparison для значений одинаковой длины;
+- проверка доступа выполняется до загрузки URL, чтения наблюдений и LLM-вызовов;
+- операции `/list`, `/check` и `/stop` проверяют владельца наблюдения;
+- количество активных наблюдений ограничено для каждого пользователя.
 
-Not supported in the MVP:
+`ACCESS_KEY` является общим ключом активации, а не одноразовым кодом. После выдачи доступа его следует удалить или заменить, если новые активации больше не нужны.
 
-- authenticated pages;
+## Защита загрузчика страниц
+
+`SafePageFetcher`:
+
+- разрешает только HTTP/HTTPS;
+- запрещает URL со встроенными credentials;
+- блокирует localhost, private, link-local и другие non-routable адреса;
+- повторно проверяет адрес после каждого redirect;
+- использует проверенный IP для HTTP-соединения;
+- ограничивает timeout, размер ответа и число redirect;
+- принимает только HTML/XHTML/plain text;
+- не отправляет cookies, пользовательские headers и данные авторизации.
+
+В `DEMO_MODE` разрешается только точный URL из `DEMO_URL`. Остальные локальные адреса остаются заблокированы.
+
+## Безопасность AI-пайплайна
+
+- LLM не получает tools и не может самостоятельно загружать страницы, менять данные или отправлять команды;
+- AI вызывается только при создании правила наблюдения и при изменении hash страницы;
+- размер текста страницы и diff ограничен конфигурацией;
+- число LLM-вызовов ограничено суточным лимитом;
+- JSON-ответ модели валидируется через Zod;
+- совпадение принимается только при `conditionMatched=true` и достаточной уверенности;
+- каждая цитата `evidence` должна буквально присутствовать в текущем тексте страницы;
+- при ошибке API, невалидном JSON или выдуманном evidence новый snapshot не сохраняется;
+- fingerprint предотвращает повторную отправку одного и того же результата.
+
+Текст страницы может содержать prompt injection. В MVP риск ограничен тем, что модель возвращает только валидируемую структуру и не имеет доступа к инструментам или секретам, однако полностью исключить ошибочную классификацию невозможно.
+
+## Секреты и данные
+
+- Telegram token, DeepSeek key и ключ активации загружаются только из environment variables;
+- `.env`, `data/*.json`, `dist/` и `node_modules/` не коммитятся;
+- JSON-хранилище записывается через временный файл и atomic rename;
+- локальное хранилище не шифруется, поэтому доступ к каталогу приложения на VPS должен быть ограничен средствами операционной системы.
+
+## Ограничения MVP
+
+Не поддерживаются:
+
+- страницы с авторизацией;
+- cookies и пользовательские headers;
 - browser automation;
-- user-provided cookies or headers;
-- JavaScript-rendered pages;
-- PDF and image content;
-- access to private networks.
+- JavaScript-rendered страницы;
+- PDF, изображения и визуальное сравнение;
+- доступ к private networks;
+- автоматические действия на отслеживаемых сайтах;
+- rate limiting попыток ввода ключа активации.

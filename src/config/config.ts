@@ -15,6 +15,13 @@ const envSchema = z.object({
   FETCH_TIMEOUT_MS: z.coerce.number().int().min(1000).max(60000).default(10000),
   MAX_RESPONSE_BYTES: z.coerce.number().int().min(1024).max(10_485_760).default(2_097_152),
   MAX_PAGE_TEXT_CHARS: z.coerce.number().int().min(1000).max(100_000).default(30_000),
+  MAX_DIFF_CHARS: z.coerce.number().int().min(1000).max(50_000).default(12_000),
+  MAX_LLM_CALLS_PER_DAY: z.coerce.number().int().min(1).max(1000).default(50),
+  MATCH_CONFIDENCE_THRESHOLD: z.coerce.number().min(0.5).max(1).default(0.8),
+  DEEPSEEK_API_KEY: z.string().min(1),
+  DEEPSEEK_BASE_URL: z.string().url().optional().default("https://api.deepseek.com"),
+  DEEPSEEK_MODEL: z.string().min(1).optional().default("deepseek-v4-flash"),
+  DEEPSEEK_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120_000).default(30_000),
   DEMO_MODE: booleanFromEnv,
   DEMO_URL: z.string().url().optional().default("http://127.0.0.1:3001/"),
 });
@@ -47,6 +54,13 @@ export interface AppConfig {
   fetchTimeoutMs: number;
   maxResponseBytes: number;
   maxPageTextChars: number;
+  maxDiffChars: number;
+  maxLlmCallsPerDay: number;
+  matchConfidenceThreshold: number;
+  deepSeekApiKey: string;
+  deepSeekBaseUrl: string;
+  deepSeekModel: string;
+  deepSeekTimeoutMs: number;
   demoMode: boolean;
   demoUrl: string;
 }
@@ -60,6 +74,13 @@ export const config: AppConfig = {
   fetchTimeoutMs: parsed.data.FETCH_TIMEOUT_MS,
   maxResponseBytes: parsed.data.MAX_RESPONSE_BYTES,
   maxPageTextChars: parsed.data.MAX_PAGE_TEXT_CHARS,
+  maxDiffChars: parsed.data.MAX_DIFF_CHARS,
+  maxLlmCallsPerDay: parsed.data.MAX_LLM_CALLS_PER_DAY,
+  matchConfidenceThreshold: parsed.data.MATCH_CONFIDENCE_THRESHOLD,
+  deepSeekApiKey: parsed.data.DEEPSEEK_API_KEY,
+  deepSeekBaseUrl: parsed.data.DEEPSEEK_BASE_URL.replace(/\/+$/, ""),
+  deepSeekModel: parsed.data.DEEPSEEK_MODEL,
+  deepSeekTimeoutMs: parsed.data.DEEPSEEK_TIMEOUT_MS,
   demoMode: parsed.data.DEMO_MODE,
   demoUrl: new URL(parsed.data.DEMO_URL).toString(),
 };

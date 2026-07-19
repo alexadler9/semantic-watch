@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Bot, type Context } from "grammy";
+import type { SemanticEvaluator } from "../ai/semantic-evaluator.js";
+import type { WatchCheckResult, WatchCheckService } from "../checker/watch-check-service.js";
 import type { AppConfig } from "../config/config.js";
 import type { Watch } from "../domain/models.js";
 import { SafePageFetcher } from "../fetcher/safe-page-fetcher.js";
@@ -16,6 +18,8 @@ export function createBot(
   appConfig: AppConfig,
   store: JsonStore,
   pageFetcher: SafePageFetcher,
+  semanticEvaluator: SemanticEvaluator,
+  checkService: WatchCheckService,
 ): Bot {
   const bot = new Bot(appConfig.telegramBotToken);
   const accessService = new AccessService(appConfig, store);
@@ -83,11 +87,30 @@ export function createBot(
           `${index + 1}. ${watch.pageTitle ?? new URL(watch.url).hostname}\n` +
           `ID: ${watch.id}\n` +
           `URL: ${watch.url}\n` +
-          `Условие: ${truncate(watch.instruction, 180)}\n` +
-          `Создано: ${formatDate(watch.createdAt)}`,
+          `Отслеживаем: ${truncate(watch.policy?.targetEvent ?? watch.instruction, 180)}\n` +
+          `Проверено: ${formatDate(watch.lastCheckedAt)}`,
       )
       .join("\n\n");
     await ctx.reply(message);
+  });
+
+  bot.command("check", async (ctx) => {
+    const userId = await requireAccess(ctx, accessService);
+    if (!userId) return;
+
+    const watch = await resolveWatchForCheck(store, userId, ctx.match.trim());
+    if (typeof watch === "string") {
+      await ctx.reply(watch);
+      return;
+    }
+
+    await ctx.reply(`Проверяю страницу «${watch.pageTitle ?? new URL(watch.url).hostname}»…`);
+    try {
+      const result = await checkService.check(watch);
+      await ctx.reply(formatCheckResult(result));
+    } catch (error) {
+      await ctx.reply(`Не удалось выполнить проверку: ${toSafeErrorMessage(error)}`);
+    }
   });
 
   bot.command("stop", async (ctx) => {
@@ -118,7 +141,7 @@ export function createBot(
 
     const pending = pendingWatches.get(userId);
     if (!pending) {
-      await ctx.reply("Не понимаю сообщение. Используйте /watch, /list или /stop.");
+      await ctx.reply("Не понимаю сообщение. Используйте /watch, /list, /check или /stop.");
       return;
     }
 
@@ -128,7 +151,7 @@ export function createBot(
         const normalized = new URL(rawUrl).toString();
         pendingWatches.set(userId, { step: "WAITING_INSTRUCTION", url: normalized });
         await ctx.reply(
-          "Что именно нужно отслеживать? Опишите событие обычным языком и при необходимости укажите, какие изменения следует игнорировать.",
+          "На что нужно обращать внимание? Опишите, о каком изменении сообщить и какие изменения можно игнорировать.",
         );
       } catch {
         await ctx.reply("Не удалось распознать ссылку. Отправьте полный URL, начинающийся с http:// или https://.");
@@ -138,11 +161,11 @@ export function createBot(
 
     const instruction = normalizeInstruction(ctx.message.text);
     if (instruction.length < 8) {
-      await ctx.reply("Условие слишком короткое. Опишите, о каком изменении нужно сообщить.");
+      await ctx.reply("Описание слишком короткое. Уточните, о каком изменении нужно сообщить.");
       return;
     }
     if (instruction.length > 2000) {
-      await ctx.reply("Условие слишком длинное. Максимум 2000 символов.");
+      await ctx.reply("Описание слишком длинное. Максимум 2000 символов.");
       return;
     }
 
@@ -153,21 +176,25 @@ export function createBot(
       return;
     }
 
-    await ctx.reply("Проверяю страницу и сохраняю исходное состояние…");
+    await ctx.reply("Проверяю страницу и настраиваю правило наблюдения…");
     try {
+      // Сначала проверяем страницу, чтобы не тратить AI-запрос на недоступный URL.
       const snapshot = await pageFetcher.fetch(url);
+      const policy = await semanticEvaluator.createPolicy(instruction);
       const now = new Date().toISOString();
       const watch: Watch = {
         id: shortId(),
         ownerTelegramId: userId,
         url: snapshot.finalUrl,
         instruction,
+        policy,
         status: "ACTIVE",
         createdAt: now,
         stoppedAt: null,
         lastCheckedAt: snapshot.fetchedAt,
         lastContentHash: snapshot.hash,
         lastSnapshot: snapshot.text,
+        lastNotificationFingerprint: null,
         pageTitle: snapshot.title,
       };
       await store.createWatch(watch);
@@ -178,13 +205,16 @@ export function createBot(
           `Страница: ${watch.pageTitle ?? new URL(watch.url).hostname}\n` +
           `ID: ${watch.id}\n` +
           `URL: ${watch.url}\n` +
-          `Условие: ${watch.instruction}\n\n` +
-          `Текущее содержимое сохранено как исходное состояние.`,
+          `Отслеживаем: ${policy.targetEvent}\n` +
+          formatOptionalList("Признаки", policy.requiredSignals) +
+          formatOptionalList("Игнорируем", policy.ignoredChanges) +
+          `\nТекущее содержимое сохранено как исходное состояние.`,
       );
     } catch (error) {
-      pendingWatches.set(userId, { step: "WAITING_URL" });
+      pendingWatches.set(userId, { step: "WAITING_INSTRUCTION", url });
       await ctx.reply(
-        `Не удалось загрузить страницу: ${toSafeErrorMessage(error)}\n\nОтправьте другую ссылку или /cancel.`,
+        `Не удалось создать наблюдение: ${toSafeErrorMessage(error)}\n\n` +
+          `Отправьте описание ещё раз или выполните /cancel.`,
       );
     }
   });
@@ -197,6 +227,60 @@ export function createBot(
   });
 
   return bot;
+}
+
+async function resolveWatchForCheck(
+  store: JsonStore,
+  userId: string,
+  requestedId: string,
+): Promise<Watch | string> {
+  if (requestedId) {
+    return (
+      (await store.findActiveWatch(userId, requestedId)) ??
+      "Активное наблюдение с таким ID не найдено. Посмотреть список: /list"
+    );
+  }
+
+  const watches = await store.listActiveWatches(userId);
+  if (watches.length === 0) {
+    return "Активных наблюдений нет. Создать: /watch";
+  }
+  if (watches.length > 1) {
+    return "У вас несколько наблюдений. Укажите нужное: /check <ID>. Получить ID: /list";
+  }
+  const onlyWatch = watches[0];
+  if (!onlyWatch) {
+    return "Активных наблюдений нет. Создать: /watch";
+  }
+  return onlyWatch;
+}
+
+function formatCheckResult(result: WatchCheckResult): string {
+  switch (result.kind) {
+    case "UNCHANGED":
+      return "Страница не изменилась. AI-анализ не запускался.";
+    case "NO_MATCH": {
+      const header = result.evaluation.conditionMatched
+        ? "Страница изменилась, но сервис не смог уверенно подтвердить нужное событие."
+        : "Страница изменилась, но отслеживаемое условие не выполнено.";
+      return [header, "", result.evaluation.summary].join("\n");
+    }
+    case "MATCH": {
+      const header = result.duplicate
+        ? "Это изменение уже было отправлено ранее."
+        : "Обнаружено важное изменение.";
+      return [
+        header,
+        "",
+        result.evaluation.summary,
+        "",
+        "Подтверждение на странице:",
+        ...result.evaluation.evidence.map((quote) => `• ${quote}`),
+        "",
+        result.watch.url,
+      ].join("\n");
+    }
+  }
 }
 
 async function requireAccess(ctx: Context, accessService: AccessService): Promise<string | null> {
@@ -227,8 +311,13 @@ function formatDate(value: string): string {
   }).format(new Date(value));
 }
 
+function formatOptionalList(title: string, values: string[]): string {
+  if (values.length === 0) return "";
+  return `\n${title}:\n${values.map((value) => `• ${value}`).join("\n")}\n`;
+}
+
 function toSafeErrorMessage(error: unknown): string {
-  return error instanceof Error ? truncate(error.message, 240) : "unknown error";
+  return error instanceof Error ? truncate(error.message, 300) : "unknown error";
 }
 
 function unauthorizedText(userId: string, activationEnabled: boolean): string {
@@ -240,13 +329,14 @@ function unauthorizedText(userId: string, activationEnabled: boolean): string {
 
 function helpText(): string {
   return [
-    "Semantic Watch отслеживает содержимое публичных веб-страниц.",
+    "Semantic Watch отслеживает значимые изменения публичных веб-страниц.",
     "",
     "/watch — создать наблюдение",
     "/list — показать активные наблюдения",
+    "/check [ID] — проверить страницу сейчас",
     "/stop <ID> — остановить наблюдение",
     "/cancel — отменить текущий диалог",
     "",
-    "На первом этапе сервис сохраняет исходное состояние страницы. Семантическая проверка изменений появится на следующем этапе.",
+    "AI вызывается только при создании правила и при реальном изменении текста страницы.",
   ].join("\n");
 }
