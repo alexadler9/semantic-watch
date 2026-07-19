@@ -1,4 +1,5 @@
 import type { Api } from "grammy";
+import { ScreenMessageRegistry } from "../bot/screen-message-registry.js";
 import { WatchCheckInProgressError, WatchCheckService } from "../checker/watch-check-service.js";
 import {
   formatImportantChange,
@@ -25,6 +26,7 @@ export class WatchScheduler {
     private readonly store: JsonStore,
     private readonly checkService: WatchCheckService,
     private readonly options: WatchSchedulerOptions,
+    private readonly screenMessages: ScreenMessageRegistry,
   ) {}
 
   start(): void {
@@ -111,6 +113,7 @@ export class WatchScheduler {
             reply_markup: importantNotificationKeyboard(item.watch),
           },
         );
+        this.screenMessages.markSeparatedByPermanentMessage(item.watch.ownerTelegramId);
         await this.store.markNotificationDelivered({
           telegramUserId: item.watch.ownerTelegramId,
           watchId: item.watch.id,

@@ -26,5 +26,5 @@ export function importantNotificationKeyboard(
   return new InlineKeyboard()
     .url("Открыть страницу", watch.url)
     .row()
-    .text("Приостановить отслеживание", `page:pause:${watch.id}`);
+    .text("Приостановить отслеживание", `notification:pause:${watch.id}`);
 }

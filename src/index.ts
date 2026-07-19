@@ -1,6 +1,7 @@
 import { DeepSeekClient } from "./ai/deepseek-client.js";
 import { SemanticEvaluator } from "./ai/semantic-evaluator.js";
 import { createBot } from "./bot/create-bot.js";
+import { ScreenMessageRegistry } from "./bot/screen-message-registry.js";
 import { WatchCheckService } from "./checker/watch-check-service.js";
 import { config } from "./config/config.js";
 import { SafePageFetcher } from "./fetcher/safe-page-fetcher.js";
@@ -34,14 +35,22 @@ async function main(): Promise<void> {
     checkIntervalMinutes: config.defaultCheckIntervalMinutes,
   });
 
-  const bot = createBot(config, store, pageFetcher, semanticEvaluator, checkService);
+  const screenMessages = new ScreenMessageRegistry();
+  const bot = createBot(
+    config,
+    store,
+    pageFetcher,
+    semanticEvaluator,
+    checkService,
+    screenMessages,
+  );
   const scheduler = new WatchScheduler(bot.api, store, checkService, {
     tickSeconds: config.schedulerTickSeconds,
     errorRetryMinutes: config.errorRetryMinutes,
     notificationRetryMinutes: config.notificationRetryMinutes,
     maxChecksPerTick: config.maxChecksPerTick,
     maxNotificationAttempts: config.maxNotificationAttempts,
-  });
+  }, screenMessages);
 
   await bot.api.setMyCommands([
     { command: "start", description: "Открыть главное меню" },

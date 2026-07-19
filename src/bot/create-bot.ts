@@ -13,11 +13,15 @@ import {
 import type { AppConfig } from "../config/config.js";
 import type { PageSnapshot, Watch, WatchPolicy } from "../domain/models.js";
 import { SafePageFetcher } from "../fetcher/safe-page-fetcher.js";
-import { formatImportantChange } from "../notifications/telegram-messages.js";
+import {
+  formatImportantChange,
+  importantNotificationKeyboard,
+} from "../notifications/telegram-messages.js";
 import { JsonStore } from "../storage/json-store.js";
 import { normalizeInstruction, truncate } from "../utils/text.js";
 import { addMinutesIso } from "../utils/time.js";
 import { AccessService } from "./access-service.js";
+import { ScreenMessageRegistry } from "./screen-message-registry.js";
 
 const MENU_ADD_PAGE = "Добавить страницу";
 const MENU_TRACKED_PAGES = "Отслеживаемые страницы";
@@ -60,17 +64,22 @@ type PageAction =
   | "delete-confirm"
   | "delete-cancel";
 
+interface NotificationAction {
+  action: "pause";
+  watchId: string;
+}
+
 export function createBot(
   appConfig: AppConfig,
   store: JsonStore,
   pageFetcher: SafePageFetcher,
   semanticEvaluator: SemanticEvaluator,
   checkService: WatchCheckService,
+  screenMessages: ScreenMessageRegistry,
 ): Bot {
   const bot = new Bot(appConfig.telegramBotToken);
   const accessService = new AccessService(appConfig, store);
   const pendingWatches = new Map<string, PendingWatch>();
-  const screenMessages = new Map<string, number>();
 
   bot.command("start", async (ctx) => {
     await tryDeleteIncomingMessage(ctx);
@@ -202,12 +211,17 @@ export function createBot(
       return;
     }
 
+    const data = ctx.callbackQuery.data;
+    const notificationAction = parseNotificationAction(data);
+    if (notificationAction) {
+      await handleNotificationAction(ctx, userId, notificationAction, store);
+      return;
+    }
+
     const callbackMessageId = getCallbackMessageId(ctx);
     if (callbackMessageId !== null) {
       screenMessages.set(userId, callbackMessageId);
     }
-
-    const data = ctx.callbackQuery.data;
 
     if (data === FLOW_CANCEL) {
       const pending = pendingWatches.get(userId);
@@ -611,7 +625,7 @@ async function startAddPage(
   ctx: Context,
   userId: string,
   pendingWatches: Map<string, PendingWatch>,
-  screenMessages: Map<string, number>,
+  screenMessages: ScreenMessageRegistry,
   store: JsonStore,
   appConfig: AppConfig,
 ): Promise<void> {
@@ -640,7 +654,7 @@ async function startAddPage(
 async function askForUrl(
   ctx: Context,
   userId: string,
-  screenMessages: Map<string, number>,
+  screenMessages: ScreenMessageRegistry,
   screenMessageId: number,
 ): Promise<void> {
   await renderScreen(
@@ -656,7 +670,7 @@ async function askForUrl(
 async function askForInstruction(
   ctx: Context,
   userId: string,
-  screenMessages: Map<string, number>,
+  screenMessages: ScreenMessageRegistry,
   screenMessageId: number,
 ): Promise<void> {
   await renderScreen(
@@ -673,7 +687,7 @@ async function showTrackedPages(
   ctx: Context,
   userId: string,
   store: JsonStore,
-  screenMessages: Map<string, number>,
+  screenMessages: ScreenMessageRegistry,
 ): Promise<void> {
   const watches = await store.listTrackedWatches(userId);
   if (watches.length === 0) {
@@ -706,7 +720,7 @@ async function renderPageCard(
   ctx: Context,
   userId: string,
   watch: Watch,
-  screenMessages: Map<string, number>,
+  screenMessages: ScreenMessageRegistry,
   preferredMessageId?: number,
 ): Promise<void> {
   await renderScreen(
@@ -725,7 +739,7 @@ async function checkPageAndRender(
   watch: Watch,
   store: JsonStore,
   checkService: WatchCheckService,
-  screenMessages: Map<string, number>,
+  screenMessages: ScreenMessageRegistry,
 ): Promise<void> {
   const screenMessageId = await renderScreen(
     ctx,
@@ -735,13 +749,12 @@ async function checkPageAndRender(
   );
 
   if (watch.pendingNotification) {
-    await renderScreen(
+    await sendPermanentNotification(
       ctx,
       userId,
+      watch,
+      watch.pendingNotification,
       screenMessages,
-      [formatImportantChange(watch, watch.pendingNotification), "", formatPageCard(watch)].join("\n"),
-      pageCardKeyboard(watch),
-      screenMessageId,
     );
     await store.markNotificationDelivered({
       telegramUserId: userId,
@@ -754,6 +767,23 @@ async function checkPageAndRender(
   try {
     const result = await checkService.check(watch);
     const updatedWatch = (await store.findTrackedWatch(userId, watch.id)) ?? result.watch;
+
+    if (result.kind === "MATCH" && !result.duplicate) {
+      await sendPermanentNotification(
+        ctx,
+        userId,
+        updatedWatch,
+        result.evaluation,
+        screenMessages,
+      );
+      await store.markNotificationDelivered({
+        telegramUserId: userId,
+        watchId: watch.id,
+        fingerprint: result.notificationFingerprint,
+      });
+      return;
+    }
+
     await renderScreen(
       ctx,
       userId,
@@ -762,14 +792,6 @@ async function checkPageAndRender(
       pageCardKeyboard(updatedWatch),
       screenMessageId,
     );
-
-    if (result.kind === "MATCH" && !result.duplicate) {
-      await store.markNotificationDelivered({
-        telegramUserId: userId,
-        watchId: watch.id,
-        fingerprint: result.notificationFingerprint,
-      });
-    }
   } catch (error) {
     const message =
       error instanceof WatchCheckInProgressError
@@ -785,6 +807,38 @@ async function checkPageAndRender(
       screenMessageId,
     );
   }
+}
+
+async function sendPermanentNotification(
+  ctx: Context,
+  userId: string,
+  watch: Watch,
+  evaluation: {
+    summary: string;
+    evidence: string[];
+  },
+  screenMessages: ScreenMessageRegistry,
+): Promise<void> {
+  const chatId = ctx.chat?.id;
+  if (chatId === undefined) {
+    throw new Error("Telegram chat ID is unavailable.");
+  }
+
+  const transientScreenId = screenMessages.get(userId);
+  if (transientScreenId !== undefined) {
+    try {
+      await ctx.api.deleteMessage(chatId, transientScreenId);
+    } catch {
+      // Экран мог быть уже удалён. Постоянное уведомление всё равно нужно доставить.
+    } finally {
+      screenMessages.delete(userId);
+    }
+  }
+
+  await ctx.api.sendMessage(chatId, formatImportantChange(watch, evaluation), {
+    link_preview_options: { is_disabled: true },
+    reply_markup: importantNotificationKeyboard(watch),
+  });
 }
 
 async function resolveWatchForCommandCheck(
@@ -961,6 +1015,45 @@ function deleteConfirmationKeyboard(watchId: string): InlineKeyboard {
     .text("Отмена", `page:delete-cancel:${watchId}`);
 }
 
+function parseNotificationAction(data: string): NotificationAction | null {
+  const match = /^notification:(pause):([a-z0-9]+)$/.exec(data);
+  if (!match) return null;
+  const action = match[1];
+  const watchId = match[2];
+  if (action !== "pause" || !watchId) return null;
+  return { action, watchId };
+}
+
+async function handleNotificationAction(
+  ctx: Context,
+  userId: string,
+  notificationAction: NotificationAction,
+  store: JsonStore,
+): Promise<void> {
+  const watch = await store.findTrackedWatch(userId, notificationAction.watchId);
+  if (!watch) {
+    await ctx.answerCallbackQuery({ text: "Страница не найдена.", show_alert: true });
+    return;
+  }
+
+  const paused = await store.pauseWatch(userId, watch.id);
+  await ctx.answerCallbackQuery({
+    text: paused ? "Отслеживание приостановлено" : "Уже приостановлено",
+  });
+
+  const chatId = ctx.chat?.id;
+  const messageId = getCallbackMessageId(ctx);
+  if (chatId === undefined || messageId === null) return;
+
+  try {
+    await ctx.api.editMessageReplyMarkup(chatId, messageId, {
+      reply_markup: new InlineKeyboard().url("Открыть страницу", watch.url),
+    });
+  } catch {
+    // Уведомление остаётся постоянным, даже если Telegram не смог обновить кнопки.
+  }
+}
+
 function parsePageAction(data: string): { action: PageAction; watchId: string } | null {
   const match = /^page:(view|check|pause|resume|delete|delete-confirm|delete-cancel):([a-z0-9]+)$/.exec(data);
   if (!match) return null;
@@ -973,7 +1066,7 @@ function parsePageAction(data: string): { action: PageAction; watchId: string } 
 async function renderScreen(
   ctx: Context,
   userId: string,
-  screenMessages: Map<string, number>,
+  screenMessages: ScreenMessageRegistry,
   text: string,
   keyboard?: InlineKeyboard,
   preferredMessageId?: number,
@@ -991,16 +1084,29 @@ async function renderScreen(
   };
 
   if (messageId !== undefined) {
-    try {
-      await ctx.api.editMessageText(chatId, messageId, text, options);
-      screenMessages.set(userId, messageId);
-      return messageId;
-    } catch (error) {
-      if (isMessageNotModifiedError(error)) {
+    const separatedByPermanentMessage =
+      screenMessages.isSeparatedByPermanentMessage(userId, messageId);
+
+    if (separatedByPermanentMessage) {
+      try {
+        await ctx.api.deleteMessage(chatId, messageId);
+      } catch {
+        // Старый UI-экран мог быть уже удалён пользователем или Telegram.
+      } finally {
+        screenMessages.delete(userId);
+      }
+    } else {
+      try {
+        await ctx.api.editMessageText(chatId, messageId, text, options);
         screenMessages.set(userId, messageId);
         return messageId;
+      } catch (error) {
+        if (isMessageNotModifiedError(error)) {
+          screenMessages.set(userId, messageId);
+          return messageId;
+        }
+        // Старое сообщение могло быть удалено или стать недоступным для редактирования.
       }
-      // Старое сообщение могло быть удалено или стать недоступным для редактирования.
     }
   }
 
